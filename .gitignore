@@ -1,5 +1,7 @@
 .idea/
 __MACOSX/
+# Locally recorded robot datasets
+teleop/utils/data/
 .DS_Store
 *pycache*
 *.pyc

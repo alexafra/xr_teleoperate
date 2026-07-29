@@ -252,11 +252,14 @@ if __name__ == '__main__':
             time.sleep(0.033)
             if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
                 head_img = img_client.get_head_frame()
-                tv_wrapper.render_to_xr(head_img)
+                tv_wrapper.render_to_xr(head_img.bgr)
 
         logger_mp.info("---------------------🚀start Tracking🚀-------------------------")
         arm_ctrl.speed_gradual_max()
         # main loop. robot start to follow VR user's motion
+        head_depth = None
+        raw_head_depth = None
+
         while not STOP:
             start_time = time.time()
             # get image
@@ -264,7 +267,15 @@ if __name__ == '__main__':
                 if args.record or xr_need_local_img:
                     head_img = img_client.get_head_frame()
                 if xr_need_local_img:
-                    tv_wrapper.render_to_xr(head_img)
+                    tv_wrapper.render_to_xr(head_img.bgr)
+                    # tv_wrapper.render_to_xr(head_img)
+            if (args.record and camera_config["head_camera"].get("enable_depth", False)):
+                head_depth = img_client.get_head_depth_frame()
+
+                if camera_config["head_camera"].get("raw_depth_zmq_port") is not None:
+                    head_raw_depth = img_client.get_head_raw_depth_frame()
+                else:
+                    head_raw_depth = None
             if camera_config['left_wrist_camera']['enable_zmq']:
                 if args.record:
                     left_wrist_img = img_client.get_left_wrist_frame()
@@ -282,6 +293,10 @@ if __name__ == '__main__':
                         logger_mp.error("Failed to create episode. Recording not started.")
                 else:
                     RECORD_RUNNING = False
+                    logger_mp.info(
+                        f"Capture stopped. Pending frames: "
+                        f"{recorder.item_data_queue.qsize()}"
+                    )
                     recorder.save_episode()
                     if args.sim:
                         publish_reset_category(1, reset_pose_publisher)
@@ -385,6 +400,17 @@ if __name__ == '__main__':
                 if RECORD_RUNNING:
                     colors = {}
                     depths = {}
+                    if camera_config["head_camera"].get("enable_depth", False):
+                        if head_depth is not None:
+                            depths["depth_0"] = head_depth
+                        else:
+                            logger_mp.warning("Head aligned-depth image is None!")
+
+                        if camera_config["head_camera"].get("raw_depth_zmq_port") is not None:
+                            if head_raw_depth is not None:
+                                depths["raw_depth_0"] = head_raw_depth
+                            else:
+                                logger_mp.warning("Head raw-depth image is None!")
                     if camera_config['head_camera']['binocular']:
                         if head_img is not None:
                             colors[f"color_{0}"] = head_img.bgr[:, :camera_config['head_camera']['image_shape'][1]//2]
@@ -403,7 +429,7 @@ if __name__ == '__main__':
                                 logger_mp.warning("Right wrist image is None!")
                     else:
                         if head_img is not None:
-                            colors[f"color_{0}"] = head_img
+                            colors[f"color_{0}"] = head_img.bgr
                         else:
                             logger_mp.warning("Head image is None!")
                         if camera_config['left_wrist_camera']['enable_zmq']:

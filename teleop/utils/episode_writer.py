@@ -106,11 +106,14 @@ class EpisodeWriter():
         self.episode_dir = os.path.join(self.task_dir, f"episode_{str(self.episode_id).zfill(4)}")
         self.color_dir = os.path.join(self.episode_dir, 'colors')
         self.depth_dir = os.path.join(self.episode_dir, 'depths')
+        self.raw_depth_dir = os.path.join(self.episode_dir, "raw_depths",)
         self.audio_dir = os.path.join(self.episode_dir, 'audios')
         self.json_path = os.path.join(self.episode_dir, 'data.json')
+
         os.makedirs(self.episode_dir, exist_ok=True)
         os.makedirs(self.color_dir, exist_ok=True)
         os.makedirs(self.depth_dir, exist_ok=True)
+        os.makedirs(self.raw_depth_dir, exist_ok=True)
         os.makedirs(self.audio_dir, exist_ok=True)
         with open(self.json_path, "w", encoding="utf-8") as f:
             f.write('{\n')
@@ -177,10 +180,28 @@ class EpisodeWriter():
         # Save depths
         if depths:
             for idx_depth, (depth_key, depth) in enumerate(depths.items()):
-                depth_name = f'{str(idx).zfill(6)}_{depth_key}.jpg'
-                if not cv2.imwrite(os.path.join(self.depth_dir, depth_name), depth):
-                    logger_mp.info(f"Failed to save depth image.")
-                item_data['depths'][depth_key] = os.path.join('depths', depth_name)
+                depth_name = f'{str(idx).zfill(6)}_{depth_key}.png'
+                if depth_key.startswith("raw_depth"):
+                    output_directory = self.raw_depth_dir
+                    relative_directory = "raw_depths"
+                else:
+                    output_directory = self.depth_dir
+                    relative_directory = "depths"
+
+                depth_path = os.path.join(
+                    output_directory,
+                    depth_name,
+                )
+
+                if not cv2.imwrite(depth_path, depth):
+                    logger_mp.info(
+                        f"Failed to save depth image: {depth_path}"
+                    )
+
+                item_data["depths"][depth_key] = os.path.join(
+                    relative_directory,
+                    depth_name,
+                )
 
         # Save audios
         if audios:
@@ -189,7 +210,7 @@ class EpisodeWriter():
                 np.save(os.path.join(self.audio_dir, audio_name), audio.astype(np.int16))
                 item_data['audios'][mic] = os.path.join('audios', audio_name)
 
-        # Update episode data
+        # Update episode data 
         with open(self.json_path, "a", encoding="utf-8") as f:
             if not self.first_item:
                 f.write(",\n")
