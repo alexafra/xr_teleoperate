@@ -55,6 +55,18 @@ class EpisodeWriter():
         self.item_data_queue = Queue(-1)
         self.stop_worker = False
         self.need_save = False  # Flag to indicate when save_episode is triggered
+        self.episode_start_monotonic = None
+        self.episode_stop_monotonic = None
+
+        self.episode_start_utc = None
+        self.episode_stop_utc = None
+
+        self.first_frame_timestamp_s = None
+        self.last_frame_timestamp_s = None
+        self.previous_frame_timestamp_s = None
+
+        self.frame_timestamps_s = []
+        self.max_frame_gap_s = 0.0
         self.worker_thread = Thread(target=self.process_queue)
         self.worker_thread.start()
 
@@ -103,13 +115,30 @@ class EpisodeWriter():
         self.item_id = -1
         self.episode_id = self.episode_id + 1
         
+        #time
+        self.episode_start_monotonic = time.perf_counter()
+        self.episode_stop_monotonic = None
+
+        self.episode_start_utc = datetime.datetime.now(
+            datetime.timezone.utc
+        ).isoformat()
+
+        self.episode_stop_utc = None
+
+        self.first_frame_timestamp_s = None
+        self.last_frame_timestamp_s = None
+        self.previous_frame_timestamp_s = None
+        self.frame_timestamps_s = []
+
+        self.max_frame_gap_s = 0.0
+        #time emd
+
         self.episode_dir = os.path.join(self.task_dir, f"episode_{str(self.episode_id).zfill(4)}")
         self.color_dir = os.path.join(self.episode_dir, 'colors')
         self.depth_dir = os.path.join(self.episode_dir, 'depths')
-        self.raw_depth_dir = os.path.join(self.episode_dir, "raw_depths",)
+        self.raw_depth_dir = os.path.join(self.episode_dir, 'raw_depths')
         self.audio_dir = os.path.join(self.episode_dir, 'audios')
         self.json_path = os.path.join(self.episode_dir, 'data.json')
-
         os.makedirs(self.episode_dir, exist_ok=True)
         os.makedirs(self.color_dir, exist_ok=True)
         os.makedirs(self.depth_dir, exist_ok=True)
@@ -130,11 +159,42 @@ class EpisodeWriter():
         return True  # Return True if the episode is successfully created
         
     def add_item(self, colors, depths=None, states=None, actions=None, tactiles=None, audios=None, sim_state=None):
+        #add time
+        if self.episode_start_monotonic is None:
+            raise RuntimeError(
+                "Cannot add an item before create_episode()"
+            )
+
+        timestamp_s = (
+            time.perf_counter()
+            - self.episode_start_monotonic
+        )
+
+        if self.first_frame_timestamp_s is None:
+            self.first_frame_timestamp_s = timestamp_s
+
+        if self.previous_frame_timestamp_s is not None:
+            frame_gap_s = (
+                timestamp_s
+                - self.previous_frame_timestamp_s
+            )
+
+            self.max_frame_gap_s = max(
+                self.max_frame_gap_s,
+                frame_gap_s,
+            )
+
+        self.previous_frame_timestamp_s = timestamp_s
+        self.last_frame_timestamp_s = timestamp_s
+        self.frame_timestamps_s.append(timestamp_s)
+        #time end
+
         # Increment the item ID
         self.item_id += 1
         # Create the item data dictionary
         item_data = {
             'idx': self.item_id,
+            'timestamp_s': timestamp_s, #time
             'colors': colors,
             'depths': depths,
             'states': states,
@@ -181,28 +241,22 @@ class EpisodeWriter():
         if depths:
             for idx_depth, (depth_key, depth) in enumerate(depths.items()):
                 depth_name = f'{str(idx).zfill(6)}_{depth_key}.png'
-                if depth_key.startswith("raw_depth"):
-                    output_directory = self.raw_depth_dir
-                    relative_directory = "raw_depths"
-                else:
-                    output_directory = self.depth_dir
-                    relative_directory = "depths"
-
-                depth_path = os.path.join(
-                    output_directory,
-                    depth_name,
+                output_directory = (
+                    self.raw_depth_dir
+                    if depth_key.startswith("raw_depth")
+                    else self.depth_dir
                 )
+                depth_path = os.path.join(output_directory, depth_name)
 
                 if not cv2.imwrite(depth_path, depth):
                     logger_mp.info(
                         f"Failed to save depth image: {depth_path}"
                     )
 
-                item_data["depths"][depth_key] = os.path.join(
-                    relative_directory,
+                item_data['depths'][depth_key] = os.path.join(
+                    os.path.basename(output_directory),
                     depth_name,
                 )
-
         # Save audios
         if audios:
             for mic, audio in audios.items():
@@ -210,7 +264,7 @@ class EpisodeWriter():
                 np.save(os.path.join(self.audio_dir, audio_name), audio.astype(np.int16))
                 item_data['audios'][mic] = os.path.join('audios', audio_name)
 
-        # Update episode data 
+        # Update episode data
         with open(self.json_path, "a", encoding="utf-8") as f:
             if not self.first_item:
                 f.write(",\n")
@@ -227,6 +281,16 @@ class EpisodeWriter():
         """
         Trigger the save operation. This sets the save flag, and the process_queue thread will handle it.
         """
+        #time
+        if self.need_save:
+            return
+
+        self.episode_stop_monotonic = time.perf_counter()
+
+        self.episode_stop_utc = datetime.datetime.now(
+            datetime.timezone.utc
+        ).isoformat()
+        #time end
         self.need_save = True  # Set the save flag
         logger_mp.info(f"==> Episode saved start...")
 
@@ -234,12 +298,78 @@ class EpisodeWriter():
         """
         Save the episode data to a JSON file.
         """
-        with open(self.json_path, "a", encoding="utf-8") as f:
-            f.write("\n]\n}")      # Close the JSON array and object
+        #timing
+        timestamps = self.frame_timestamps_s
+        frame_count = len(timestamps)
 
+        if (
+            self.episode_start_monotonic is not None
+            and self.episode_stop_monotonic is not None
+        ):
+            recording_duration_s = (
+                self.episode_stop_monotonic
+                - self.episode_start_monotonic
+            )
+        else:
+            recording_duration_s = 0.0
+
+        if frame_count >= 2:
+            sample_duration_s = (
+                timestamps[-1]
+                - timestamps[0]
+            )
+
+            measured_fps = (
+                (frame_count - 1) / sample_duration_s
+                if sample_duration_s > 0
+                else 0.0
+            )
+
+            frame_gaps = [
+                timestamps[i] - timestamps[i - 1]
+                for i in range(1, frame_count)
+            ]
+
+            max_frame_gap_s = max(frame_gaps)
+        else:
+            sample_duration_s = 0.0
+            measured_fps = 0.0
+            max_frame_gap_s = 0.0
+
+        timing = {
+            "target_fps": float(self.frequency),
+            "capture_start_utc": self.episode_start_utc,
+            "capture_stop_utc": self.episode_stop_utc,
+            "recording_duration_s": recording_duration_s,
+            "sample_duration_s": sample_duration_s,
+            "frame_count": frame_count,
+            "measured_fps": measured_fps,
+            "max_frame_gap_s": max_frame_gap_s,
+        }
+
+        with open(
+            self.json_path,
+            "a",
+            encoding="utf-8",
+        ) as f:
+            f.write("\n],\n")
+            f.write(
+                '"timing": '
+                + json.dumps(
+                    timing,
+                    ensure_ascii=False,
+                    indent=4,
+                )
+            )
+            f.write("\n}")
+        #timing end
         self.need_save = False     # Reset the save flag
         self.is_available = True   # Mark the class as available after saving
-        logger_mp.info(f"==> Episode saved successfully to {self.json_path}.")
+        logger_mp.info("==> Episode saved successfully to "
+            f"{self.json_path}. "
+            f"Frames={frame_count}, "
+            f"measured_fps={measured_fps:.2f}, "
+            f"max_gap={max_frame_gap_s:.3f}s")
 
     def close(self):
         """
