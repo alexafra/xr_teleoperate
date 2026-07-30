@@ -248,7 +248,7 @@ class EpisodeWriter():
                 )
                 depth_path = os.path.join(output_directory, depth_name)
 
-                if not cv2.imwrite(depth_path, depth):
+                if not cv2.imwrite(depth_path, depth, [cv2.IMWRITE_PNG_COMPRESSION, 1]):
                     logger_mp.info(
                         f"Failed to save depth image: {depth_path}"
                     )
