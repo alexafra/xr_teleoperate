@@ -232,12 +232,20 @@ if __name__ == '__main__':
 
         # record + headless / non-headless mode
         if args.record:
+            head_config = camera_config["head_camera"]
+
+            depth_scale = None
+            if head_config.get("enable_depth", False):
+                depth_scale = head_config[
+                    "depth_scale_m_per_unit"
+                ]
             recorder = EpisodeWriter(task_dir = os.path.join(args.task_dir, args.task_name),
                                      task_goal = args.task_goal,
                                      task_desc = args.task_desc,
                                      task_steps = args.task_steps,
                                      frequency = args.frequency, 
-                                     rerun_log = not args.headless)
+                                     rerun_log = not args.headless,
+                                     depth_scale_m_per_unit=depth_scale,)
 
         logger_mp.info("----------------------------------------------------------------")
         logger_mp.info("🟢  Press [r] to start syncing the robot with your movements.")

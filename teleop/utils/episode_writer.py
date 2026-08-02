@@ -11,7 +11,7 @@ import logging_mp
 logger_mp = logging_mp.getLogger(__name__)
 
 class EpisodeWriter():
-    def __init__(self, task_dir, task_goal=None, task_desc = None, task_steps = None, frequency=30, image_size=[640, 480], rerun_log = True):
+    def __init__(self, task_dir, task_goal=None, task_desc = None, task_steps = None, frequency=30, image_size=[640, 480], rerun_log = True, depth_scale_m_per_unit=None):
         """
         image_size: [width, height]
         """
@@ -31,6 +31,20 @@ class EpisodeWriter():
 
         self.frequency = frequency
         self.image_size = image_size
+
+        self.depth_scale_m_per_unit = (
+            None
+            if depth_scale_m_per_unit is None
+            else float(depth_scale_m_per_unit)
+        )
+
+        if (
+            self.depth_scale_m_per_unit is not None
+            and self.depth_scale_m_per_unit <= 0
+        ):
+            raise ValueError(
+                "depth_scale_m_per_unit must be positive"
+            )
 
         self.rerun_log = rerun_log
         if self.rerun_log:
@@ -80,8 +94,18 @@ class EpisodeWriter():
                 "version": "1.0.0" if version is None else version, 
                 "date": datetime.date.today().strftime('%Y-%m-%d') if date is None else date,
                 "author": "unitree" if author is None else author,
-                "image": {"width":self.image_size[0], "height":self.image_size[1], "fps":self.frequency},
-                "depth": {"width":self.image_size[0], "height":self.image_size[1], "fps":self.frequency},
+                "image": {
+                    "width":self.image_size[0], 
+                    "height":self.image_size[1],
+                    "fps":self.frequency
+                },
+                "depth": {
+                    "width":self.image_size[0], 
+                    "height":self.image_size[1], 
+                    "fps":self.frequency
+                    ,"scale_m_per_unit": self.depth_scale_m_per_unit,
+                },
+                          
                 "audio": {"sample_rate": 16000, "channels": 1, "format":"PCM", "bits":16},    # PCM_S16
                 "joint_names":{
                     "left_arm":   [],
