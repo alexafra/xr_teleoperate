@@ -59,12 +59,14 @@ class DataBuffer:
             self.data = data
 
 class G1_29_ArmController:
-    def __init__(self, motion_mode = False, simulation_mode = False):
+    def __init__(self, motion_mode = False, simulation_mode = False, control_side = "both"):
         logger_mp.info("Initialize G1_29_ArmController...")
         self.q_target = np.zeros(14)
         self.tauff_target = np.zeros(14)
         self.motion_mode = motion_mode
         self.simulation_mode = simulation_mode
+        self.control_side = control_side
+        self.left_arm_hold_q = None
         self.kp_high = 300.0
         self.kd_high = 3.0
         self.kp_low = 80.0
@@ -106,8 +108,12 @@ class G1_29_ArmController:
         self.msg.mode_machine = self.get_mode_machine()
 
         self.all_motor_q = self.get_current_motor_q()
+        current_lr_arm_q = self.get_current_dual_arm_q()
+        if self.control_side == "right":
+            self.left_arm_hold_q = current_lr_arm_q[:7].copy()
+            self.q_target[:7] = self.left_arm_hold_q
         logger_mp.debug(f"Current all body motor state q:\n{self.all_motor_q} \n")
-        logger_mp.debug(f"Current two arms motor state q:\n{self.get_current_dual_arm_q()}\n")
+        logger_mp.debug(f"Current two arms motor state q:\n{current_lr_arm_q}\n")
         logger_mp.info("Lock all joints except two arms...")
 
         arm_indices = set(member.value for member in G1_29_JointArmIndex)
@@ -194,6 +200,11 @@ class G1_29_ArmController:
     def ctrl_dual_arm(self, q_target, tauff_target):
         '''Set control target values q & tau of the left and right arm motors.'''
         with self.ctrl_lock:
+            if self.control_side == "right":
+                q_target = q_target.copy()
+                tauff_target = tauff_target.copy()
+                q_target[:7] = self.left_arm_hold_q
+                tauff_target[:7] = 0.0
             self.q_target = q_target
             self.tauff_target = tauff_target
 
@@ -220,16 +231,18 @@ class G1_29_ArmController:
         current_attempts = 0
         with self.ctrl_lock:
             self.q_target = np.zeros(14)
+            if self.control_side == "right":
+                self.q_target[:7] = self.left_arm_hold_q
             # self.tauff_target = np.zeros(14)
         tolerance = 0.05  # Tolerance threshold for joint angles to determine "close to zero", can be adjusted based on your motor's precision requirements
         while current_attempts < max_attempts:
             current_q = self.get_current_dual_arm_q()
-            if np.all(np.abs(current_q) < tolerance):
+            if np.all(np.abs(current_q - self.q_target) < tolerance):
                 if self.motion_mode:
                     for weight in np.linspace(1, 0, num=101):
                         self.msg.motor_cmd[G1_29_JointIndex.kNotUsedJoint0].q = weight;
                         time.sleep(0.02)
-                logger_mp.info("[G1_29_ArmController] both arms have reached the home position.")
+                logger_mp.info("[G1_29_ArmController] arms have reached the home position.")
                 break
             current_attempts += 1
             time.sleep(0.05)

@@ -78,6 +78,7 @@ if __name__ == '__main__':
     parser.add_argument('--display-mode', type=str, choices=['immersive', 'ego', 'pass-through'], default='immersive', help='Select XR device display mode')
     parser.add_argument('--arm', type=str, choices=['G1_29', 'G1_23', 'H1_2', 'H1'], default='G1_29', help='Select arm controller')
     parser.add_argument('--ee', type=str, choices=['dex1', 'dex3', 'inspire_ftp', 'inspire_dfx', 'brainco'], help='Select end effector controller')
+    parser.add_argument('--control-side', type=str, choices=['right', 'both'], default='right', help='Control the right arm/hand only or both sides')
     parser.add_argument('--img-server-ip', type=str, default='192.168.123.164', help='IP address of image server, used by teleimager and televuer')
     parser.add_argument('--network-interface', type=str, default=None, help='Network interface for dds communication, e.g., eth0, wlan0. If None, use default interface.')
     # mode flags
@@ -95,6 +96,8 @@ if __name__ == '__main__':
     parser.add_argument('--task-steps', type = str, default = 'step1: do this; step2: do that;', help = 'task steps for recording at json file')
 
     args = parser.parse_args()
+    if args.control_side == "right" and (args.arm != "G1_29" or args.ee != "dex3" or args.input_mode != "hand"):
+        parser.error("--control-side=right currently requires --arm=G1_29 --ee=dex3 --input-mode=hand")
     logger_mp.info(f"args: {args}")
 
     try:
@@ -132,6 +135,7 @@ if __name__ == '__main__':
                                      zmq=camera_config['head_camera']['enable_zmq'],
                                      webrtc=camera_config['head_camera']['enable_webrtc'],
                                      webrtc_url=f"https://{args.img_server_ip}:{camera_config['head_camera']['webrtc_port']}/offer",
+                                     control_side=args.control_side,
                                      )
         
         # motion mode (G1: Regular mode R1+X, not Running mode R2+A)
@@ -146,7 +150,7 @@ if __name__ == '__main__':
         # arm
         if args.arm == "G1_29":
             arm_ik = G1_29_ArmIK()
-            arm_ctrl = G1_29_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
+            arm_ctrl = G1_29_ArmController(motion_mode=args.motion, simulation_mode=args.sim, control_side=args.control_side)
         elif args.arm == "G1_23":
             arm_ik = G1_23_ArmIK()
             arm_ctrl = G1_23_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
@@ -166,7 +170,7 @@ if __name__ == '__main__':
             dual_hand_state_array = Array('d', 14, lock = False)   # [output] current left, right hand state(14) data.
             dual_hand_action_array = Array('d', 14, lock = False)  # [output] current left, right hand action(14) data.
             hand_ctrl = Dex3_1_Controller(left_hand_pos_array, right_hand_pos_array, dual_hand_data_lock, 
-                                          dual_hand_state_array, dual_hand_action_array, simulation_mode=args.sim)
+                                          dual_hand_state_array, dual_hand_action_array, simulation_mode=args.sim, control_side=args.control_side)
         elif args.ee == "dex1":
             from teleop.robot_control.robot_hand_unitree import Dex1_1_Gripper_Controller
             left_gripper_value = Value('d', 0.0, lock=True)        # [input]
@@ -284,7 +288,7 @@ if __name__ == '__main__':
                     head_raw_depth = img_client.get_head_raw_depth_frame()
                 else:
                     head_raw_depth = None
-            if camera_config['left_wrist_camera']['enable_zmq']:
+            if args.control_side == "both" and camera_config['left_wrist_camera']['enable_zmq']:
                 if args.record:
                     left_wrist_img = img_client.get_left_wrist_frame()
             if camera_config['right_wrist_camera']['enable_zmq']:
@@ -312,8 +316,9 @@ if __name__ == '__main__':
             # get xr's tele data
             tele_data = tv_wrapper.get_tele_data()
             if (args.ee == "dex3" or args.ee == "inspire_dfx" or args.ee == "inspire_ftp" or args.ee == "brainco") and args.input_mode == "hand":
-                with left_hand_pos_array.get_lock():
-                    left_hand_pos_array[:] = tele_data.left_hand_pos.flatten()
+                if args.control_side == "both":
+                    with left_hand_pos_array.get_lock():
+                        left_hand_pos_array[:] = tele_data.left_hand_pos.flatten()
                 with right_hand_pos_array.get_lock():
                     right_hand_pos_array[:] = tele_data.right_hand_pos.flatten()
             elif args.ee == "dex1" and args.input_mode == "controller":
@@ -425,14 +430,14 @@ if __name__ == '__main__':
                             colors[f"color_{1}"] = head_img.bgr[:, camera_config['head_camera']['image_shape'][1]//2:]
                         else:
                             logger_mp.warning("Head image is None!")
-                        if camera_config['left_wrist_camera']['enable_zmq']:
+                        if args.control_side == "both" and camera_config['left_wrist_camera']['enable_zmq']:
                             if left_wrist_img is not None:
                                 colors[f"color_{2}"] = left_wrist_img.bgr
                             else:
                                 logger_mp.warning("Left wrist image is None!")
                         if camera_config['right_wrist_camera']['enable_zmq']:
                             if right_wrist_img is not None:
-                                colors[f"color_{3}"] = right_wrist_img.bgr
+                                colors[f"color_{2 if args.control_side == 'right' else 3}"] = right_wrist_img.bgr
                             else:
                                 logger_mp.warning("Right wrist image is None!")
                     else:
@@ -440,14 +445,14 @@ if __name__ == '__main__':
                             colors[f"color_{0}"] = head_img.bgr
                         else:
                             logger_mp.warning("Head image is None!")
-                        if camera_config['left_wrist_camera']['enable_zmq']:
+                        if args.control_side == "both" and camera_config['left_wrist_camera']['enable_zmq']:
                             if left_wrist_img is not None:
                                 colors[f"color_{1}"] = left_wrist_img.bgr
                             else:
                                 logger_mp.warning("Left wrist image is None!")
                         if camera_config['right_wrist_camera']['enable_zmq']:
                             if right_wrist_img is not None:
-                                colors[f"color_{2}"] = right_wrist_img.bgr
+                                colors[f"color_{1 if args.control_side == 'right' else 2}"] = right_wrist_img.bgr
                             else:
                                 logger_mp.warning("Right wrist image is None!")
                     states = {
@@ -500,6 +505,11 @@ if __name__ == '__main__':
                             "qpos": current_body_action,
                         }, 
                     }
+                    if args.control_side == "right":
+                        states.pop("left_arm")
+                        states.pop("left_ee")
+                        actions.pop("left_arm")
+                        actions.pop("left_ee")
                     if args.sim:
                         sim_state = sim_state_subscriber.read_data()            
                         recorder.add_item(colors=colors, depths=depths, states=states, actions=actions, sim_state=sim_state)

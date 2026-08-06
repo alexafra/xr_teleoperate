@@ -33,7 +33,7 @@ kTopicDex3RightState = "rt/dex3/right/state"
 
 class Dex3_1_Controller:
     def __init__(self, left_hand_array_in, right_hand_array_in, dual_hand_data_lock = None, dual_hand_state_array_out = None,
-                       dual_hand_action_array_out = None, fps = 100.0, Unit_Test = False, simulation_mode = False):
+                       dual_hand_action_array_out = None, fps = 100.0, Unit_Test = False, simulation_mode = False, control_side = "both"):
         """
         [note] A *_array type parameter requires using a multiprocessing Array, because it needs to be passed to the internal child process
 
@@ -58,19 +58,22 @@ class Dex3_1_Controller:
         self.fps = fps
         self.Unit_Test = Unit_Test
         self.simulation_mode = simulation_mode
+        self.control_side = control_side
         if not self.Unit_Test:
             self.hand_retargeting = HandRetargeting(HandType.UNITREE_DEX3)
         else:
             self.hand_retargeting = HandRetargeting(HandType.UNITREE_DEX3_Unit_Test)
 
         # initialize handcmd publisher and handstate subscriber
-        self.LeftHandCmb_publisher = ChannelPublisher(kTopicDex3LeftCommand, HandCmd_)
-        self.LeftHandCmb_publisher.Init()
+        if self.control_side == "both":
+            self.LeftHandCmb_publisher = ChannelPublisher(kTopicDex3LeftCommand, HandCmd_)
+            self.LeftHandCmb_publisher.Init()
         self.RightHandCmb_publisher = ChannelPublisher(kTopicDex3RightCommand, HandCmd_)
         self.RightHandCmb_publisher.Init()
 
-        self.LeftHandState_subscriber = ChannelSubscriber(kTopicDex3LeftState, HandState_)
-        self.LeftHandState_subscriber.Init()
+        if self.control_side == "both":
+            self.LeftHandState_subscriber = ChannelSubscriber(kTopicDex3LeftState, HandState_)
+            self.LeftHandState_subscriber.Init()
         self.RightHandState_subscriber = ChannelSubscriber(kTopicDex3RightState, HandState_)
         self.RightHandState_subscriber.Init()
 
@@ -84,7 +87,7 @@ class Dex3_1_Controller:
         self.subscribe_state_thread.start()
 
         while True:
-            if any(self.left_hand_state_array) and any(self.right_hand_state_array):
+            if any(self.right_hand_state_array) and (self.control_side == "right" or any(self.left_hand_state_array)):
                 break
             time.sleep(0.01)
             logger_mp.warning("[Dex3_1_Controller] Waiting to subscribe dds...")
@@ -99,12 +102,13 @@ class Dex3_1_Controller:
 
     def _subscribe_hand_state(self):
         while True:
-            left_hand_msg  = self.LeftHandState_subscriber.Read()
+            left_hand_msg = self.LeftHandState_subscriber.Read() if self.control_side == "both" else None
             right_hand_msg = self.RightHandState_subscriber.Read()
-            if left_hand_msg is not None and right_hand_msg is not None:
+            if left_hand_msg is not None:
                 # Update left hand state
                 for idx, id in enumerate(Dex3_1_Left_JointIndex):
                     self.left_hand_state_array[idx] = left_hand_msg.motor_state[id].q
+            if right_hand_msg is not None:
                 # Update right hand state
                 for idx, id in enumerate(Dex3_1_Right_JointIndex):
                     self.right_hand_state_array[idx] = right_hand_msg.motor_state[id].q
@@ -125,12 +129,13 @@ class Dex3_1_Controller:
 
     def ctrl_dual_hand(self, left_q_target, right_q_target):
         """set current left, right hand motor state target q"""
-        for idx, id in enumerate(Dex3_1_Left_JointIndex):
-            self.left_msg.motor_cmd[id].q = left_q_target[idx]
+        if self.control_side == "both":
+            for idx, id in enumerate(Dex3_1_Left_JointIndex):
+                self.left_msg.motor_cmd[id].q = left_q_target[idx]
+            self.LeftHandCmb_publisher.Write(self.left_msg)
         for idx, id in enumerate(Dex3_1_Right_JointIndex):
             self.right_msg.motor_cmd[id].q = right_q_target[idx]
 
-        self.LeftHandCmb_publisher.Write(self.left_msg)
         self.RightHandCmb_publisher.Write(self.right_msg)
         # logger_mp.debug("hand ctrl publish ok.")
     
@@ -139,7 +144,7 @@ class Dex3_1_Controller:
         self.running = True
 
         left_q_target  = np.full(Dex3_Num_Motors, 0)
-        right_q_target = np.full(Dex3_Num_Motors, 0)
+        right_q_target = np.array(right_hand_state_array[:]) if self.control_side == "right" else np.full(Dex3_Num_Motors, 0)
 
         q = 0.0
         dq = 0.0
@@ -148,16 +153,17 @@ class Dex3_1_Controller:
         kd = 0.2
 
         # initialize dex3-1's left hand cmd msg
-        self.left_msg  = unitree_hg_msg_dds__HandCmd_()
-        for id in Dex3_1_Left_JointIndex:
-            ris_mode = self._RIS_Mode(id = id, status = 0x01)
-            motor_mode = ris_mode._mode_to_uint8()
-            self.left_msg.motor_cmd[id].mode = motor_mode
-            self.left_msg.motor_cmd[id].q    = q
-            self.left_msg.motor_cmd[id].dq   = dq
-            self.left_msg.motor_cmd[id].tau  = tau
-            self.left_msg.motor_cmd[id].kp   = kp
-            self.left_msg.motor_cmd[id].kd   = kd
+        if self.control_side == "both":
+            self.left_msg  = unitree_hg_msg_dds__HandCmd_()
+            for id in Dex3_1_Left_JointIndex:
+                ris_mode = self._RIS_Mode(id = id, status = 0x01)
+                motor_mode = ris_mode._mode_to_uint8()
+                self.left_msg.motor_cmd[id].mode = motor_mode
+                self.left_msg.motor_cmd[id].q    = q
+                self.left_msg.motor_cmd[id].dq   = dq
+                self.left_msg.motor_cmd[id].tau  = tau
+                self.left_msg.motor_cmd[id].kp   = kp
+                self.left_msg.motor_cmd[id].kd   = kd
 
         # initialize dex3-1's right hand cmd msg
         self.right_msg = unitree_hg_msg_dds__HandCmd_()
@@ -175,20 +181,22 @@ class Dex3_1_Controller:
             while self.running:
                 start_time = time.time()
                 # get dual hand state
-                with left_hand_array_in.get_lock():
-                    left_hand_data  = np.array(left_hand_array_in[:]).reshape(25, 3).copy()
+                if self.control_side == "both":
+                    with left_hand_array_in.get_lock():
+                        left_hand_data  = np.array(left_hand_array_in[:]).reshape(25, 3).copy()
                 with right_hand_array_in.get_lock():
                     right_hand_data = np.array(right_hand_array_in[:]).reshape(25, 3).copy()
 
                 # Read left and right q_state from shared arrays
                 state_data = np.concatenate((np.array(left_hand_state_array[:]), np.array(right_hand_state_array[:])))
 
-                if not np.all(right_hand_data == 0.0) and not np.all(left_hand_data[4] == np.array([-1.13, 0.3, 0.15])): # if hand data has been initialized.
-                    ref_left_value = left_hand_data[self.hand_retargeting.left_indices[1,:]] - left_hand_data[self.hand_retargeting.left_indices[0,:]]
+                if not np.all(right_hand_data == 0.0): # if hand data has been initialized.
                     ref_right_value = right_hand_data[self.hand_retargeting.right_indices[1,:]] - right_hand_data[self.hand_retargeting.right_indices[0,:]]
 
-                    left_q_target  = self.hand_retargeting.left_retargeting.retarget(ref_left_value)[self.hand_retargeting.right_dex_retargeting_to_hardware]
                     right_q_target = self.hand_retargeting.right_retargeting.retarget(ref_right_value)[self.hand_retargeting.right_dex_retargeting_to_hardware]
+                    if self.control_side == "both" and not np.all(left_hand_data[4] == np.array([-1.13, 0.3, 0.15])):
+                        ref_left_value = left_hand_data[self.hand_retargeting.left_indices[1,:]] - left_hand_data[self.hand_retargeting.left_indices[0,:]]
+                        left_q_target = self.hand_retargeting.left_retargeting.retarget(ref_left_value)[self.hand_retargeting.right_dex_retargeting_to_hardware]
 
                 # get dual hand action
                 action_data = np.concatenate((left_q_target, right_q_target))    
