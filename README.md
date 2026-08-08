@@ -226,6 +226,7 @@ build  cert.pem  key.pem  LICENSE  pyproject.toml  README.md  rootCA.key  rootCA
 |   `--ipc`    | **Inter-process communication mode** Allows controlling the xr_teleoperate program’s state via IPC. Suitable for interaction with agent programs. |
 | `--affinity` | **CPU affinity mode** Set CPU core affinity. If you are unsure what this is, do not set it. |
 |  `--record`  | **Enable data recording mode** Press **r** to start teleoperation, then **s** to start recording; press **s** again to stop and save the episode. Press **s** repeatedly to repeat the process. |
+|  `--voice-feedback`  | Speak **"Recording started"** after an episode starts successfully and **"Recording saved"** after it finishes saving. Requires `spd-say`. |
 |  `--task-*`  | Configure the save path, target, description, and steps of the recorded task. |
 
 ## 1.4 🔄 State Transition Diagram

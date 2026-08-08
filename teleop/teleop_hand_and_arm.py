@@ -20,6 +20,7 @@ from teleimager.image_client import ImageClient
 from teleop.utils.episode_writer import EpisodeWriter
 from teleop.utils.ipc import IPC_Server
 from teleop.utils.motion_switcher import MotionSwitcher, LocoClientWrapper
+from teleop.utils.voice_feedback import VoiceFeedback
 from sshkeyboard import listen_keyboard, stop_listening
 
 # for simulation
@@ -88,6 +89,7 @@ if __name__ == '__main__':
     parser.add_argument('--affinity', action = 'store_true', help = 'Enable high priority and set CPU affinity mode')
     # record mode and task info
     parser.add_argument('--record', action = 'store_true', help = 'Enable data recording mode')
+    parser.add_argument('--voice-feedback', action='store_true', help='Speak when an episode starts and finishes saving')
     parser.add_argument('--task-dir', type = str, default = './utils/data/', help = 'path to save data')
     parser.add_argument('--task-name', type = str, default = 'pick cube', help = 'task file name for recording')
     parser.add_argument('--task-goal', type = str, default = 'pick up cube.', help = 'task goal for recording at json file')
@@ -96,6 +98,7 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
     logger_mp.info(f"args: {args}")
+    voice_feedback = VoiceFeedback(args.voice_feedback)
 
     try:
         # setup dds communication domains id
@@ -245,7 +248,8 @@ if __name__ == '__main__':
                                      task_steps = args.task_steps,
                                      frequency = args.frequency, 
                                      rerun_log = not args.headless,
-                                     depth_scale_m_per_unit=depth_scale,)
+                                     depth_scale_m_per_unit=depth_scale,
+                                     on_episode_saved=lambda: voice_feedback.say("Recording saved"),)
 
         logger_mp.info("----------------------------------------------------------------")
         logger_mp.info("🟢  Press [r] to start syncing the robot with your movements.")
@@ -297,6 +301,7 @@ if __name__ == '__main__':
                 if not RECORD_RUNNING:
                     if recorder.create_episode():
                         RECORD_RUNNING = True
+                        voice_feedback.say("Recording started")
                     else:
                         logger_mp.error("Failed to create episode. Recording not started.")
                 else:

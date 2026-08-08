@@ -238,6 +238,7 @@ build  cert.pem  key.pem  LICENSE  pyproject.toml  README.md  rootCA.key  rootCA
 |   `--ipc`    | 【进程间通信模式】<br />可通过进程间通信来控制 xr_teleoperate 程序的状态切换，此模式适合与代理程序进行交互 |
 | `--affinity` | 【CPU亲和模式】<br />设置 CPU 核心亲和性。如果你不知道这是什么，那么请不要设置它。 |
 |  `--record`  | 【启用**数据录制**模式】<br />按 **r** 键进入遥操后，按 **s** 键可开启数据录制，再次按 **s** 键可结束录制并保存本次 episode 数据。<br />继续按下 **s** 键可重复前述过程。 |
+|  `--voice-feedback`  | episode 成功开始后播报 **"Recording started"**，成功保存完成后播报 **"Recording saved"**。需要安装 `spd-say`。 |
 |  `--task-*`  | 此类参数可配置录制的文件保存路径，任务目标、描述、步骤等信息 |
 
 

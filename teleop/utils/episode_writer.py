@@ -11,7 +11,7 @@ import logging_mp
 logger_mp = logging_mp.getLogger(__name__)
 
 class EpisodeWriter():
-    def __init__(self, task_dir, task_goal=None, task_desc = None, task_steps = None, frequency=30, image_size=[640, 480], rerun_log = True, depth_scale_m_per_unit=None):
+    def __init__(self, task_dir, task_goal=None, task_desc = None, task_steps = None, frequency=30, image_size=[640, 480], rerun_log = True, depth_scale_m_per_unit=None, on_episode_saved=None):
         """
         image_size: [width, height]
         """
@@ -31,6 +31,7 @@ class EpisodeWriter():
 
         self.frequency = frequency
         self.image_size = image_size
+        self.on_episode_saved = on_episode_saved
 
         self.depth_scale_m_per_unit = (
             None
@@ -394,6 +395,13 @@ class EpisodeWriter():
             f"Frames={frame_count}, "
             f"measured_fps={measured_fps:.2f}, "
             f"max_gap={max_frame_gap_s:.3f}s")
+        if self.on_episode_saved is not None:
+            try:
+                self.on_episode_saved()
+            except Exception as exc:
+                logger_mp.warning(
+                    f"Episode saved, but its completion callback failed: {exc}"
+                )
 
     def close(self):
         """
