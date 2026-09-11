@@ -228,6 +228,32 @@ build  cert.pem  key.pem  LICENSE  pyproject.toml  README.md  rootCA.key  rootCA
 |  `--record`  | **Enable data recording mode** Press **r** to start teleoperation, then **s** to start recording; press **s** again to stop and save the episode. Press **s** repeatedly to repeat the process. |
 |  `--task-*`  | Configure the save path, target, description, and steps of the recorded task. |
 
+### Episode timing and DDS quality report
+
+New recordings save top-level `timing` and `diagnostics` summaries in each
+`episode_*/data.json`. Inspect a task after collection without moving, deleting,
+or changing any episode:
+
+```bash
+cd ~/xr_teleoperate
+python -m teleop.utils.episode_quality \
+  teleop/utils/data/stack_three_cups_09_11 \
+  --max-frame-gap-s 0.075 \
+  --min-measured-fps 29 \
+  --json-manifest /tmp/stack_three_cups_quality.json \
+  --tsv-manifest /tmp/stack_three_cups_quality.tsv
+```
+
+The terminal table reports frame count/rate, largest recorded frame gap, DDS
+state gaps, and the extra DFX lost/reset/divergence/malformed counters. An
+episode is `clean` only when all required diagnostics are present, every
+relevant counter is zero, and its timing passes the selected limits. A measured
+failure is `reject`; old or incomplete episodes without enough diagnostic
+evidence are `unknown`. Manifests contain separate `clean`, `reject`, and
+`unknown` lists and refuse to overwrite an existing file. Omit the manifest
+options for a terminal-only, fully read-only report. Run
+`python -m teleop.utils.episode_quality --help` for all options.
+
 ## 1.4 🔄 State Transition Diagram
 
 <p align="center">
