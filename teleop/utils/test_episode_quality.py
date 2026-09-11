@@ -10,11 +10,30 @@ from pathlib import Path
 from teleop.utils.episode_quality import classify_episode, main, scan_task
 
 
-def _timing(*, fps=29.8, max_gap=0.04, frame_count=3):
+_LEFT_INSPIRE_NAMES = [
+    "kLeftHandPinky",
+    "kLeftHandRing",
+    "kLeftHandMiddle",
+    "kLeftHandIndex",
+    "kLeftHandThumbBend",
+    "kLeftHandThumbRotation",
+]
+_RIGHT_INSPIRE_NAMES = [name.replace("Left", "Right") for name in _LEFT_INSPIRE_NAMES]
+
+
+def _timing(*, fps=30.0, max_gap=None, frame_count=3):
+    sample_duration = 0.0 if frame_count < 2 else (frame_count - 1) / fps
     return {
+        "target_fps": 30.0,
+        "capture_start_utc": "2026-09-12T00:00:00+00:00",
+        "capture_stop_utc": "2026-09-12T00:00:01+00:00",
+        "recording_duration_s": sample_duration + 0.02,
+        "sample_duration_s": sample_duration,
         "frame_count": frame_count,
         "measured_fps": fps,
-        "max_frame_gap_s": max_gap,
+        "max_frame_gap_s": (
+            0.0 if frame_count < 2 else (1.0 / fps if max_gap is None else max_gap)
+        ),
     }
 
 
@@ -31,48 +50,125 @@ def _dds(*, left=0, right=0, combined=None, protocol="dex3"):
             "has_received_valid_sample": True,
             "sample_count": 3,
             "gap_count": gap_count,
+            "recovered_gap_count": gap_count,
+            "open_gap_at_end": False,
+            "last_sample_age_s_at_end": 0.001,
+            "total_gap_duration_s": 0.08 * gap_count,
+            "max_gap_duration_s": 0.08 if gap_count else 0.0,
+            "gaps": [
+                {
+                    "start_offset_s": 0.01 + (0.1 * index),
+                    "end_offset_s": 0.09 + (0.1 * index),
+                    "duration_s": 0.08,
+                    "recovered": True,
+                }
+                for index in range(gap_count)
+            ],
         }
 
     if combined is not None:
         return {
             "schema_version": 1,
             "metric": "valid_state_receive_gap",
+            "definition": (
+                "A valid ChannelSubscriber.Read() inter-arrival gap strictly "
+                "greater than gap_threshold_s"
+            ),
+            "gap_threshold_s": 0.075,
+            "window_duration_s": 1.0,
             "combined": stream("combined", combined),
             "total_stream_gap_count": combined,
+            "any_gap": combined > 0,
         }
     return {
         "schema_version": 1,
         "metric": "valid_state_receive_gap",
+        "definition": (
+            "A valid ChannelSubscriber.Read() inter-arrival gap strictly "
+            "greater than gap_threshold_s"
+        ),
+        "gap_threshold_s": 0.075,
+        "window_duration_s": 1.0,
         "left": stream("left", left),
         "right": stream("right", right),
         "total_side_gap_count": left + right,
+        "any_gap": left + right > 0,
     }
 
 
 def _dfx_lost(*, lost=0, resets=0, divergence=0, malformed=0):
     def side(side_lost, side_resets, side_divergence):
+        baseline_count = 0
+        held_count = baseline_count + int(side_lost > 0) + side_resets
         return {
+            "sample_count": 3,
+            "baseline_count": baseline_count,
+            "accepted_count": 3 - held_count,
+            "held_sample_count": held_count,
             "drop_event_count": int(side_lost > 0),
             "lost_increment_count": side_lost,
             "reset_count": side_resets,
             "counter_regression_count": side_resets - side_divergence,
             "counter_divergence_count": side_divergence,
+            "baseline_at_start": [0] * 6,
+            "baseline_at_end": [side_lost] * 6,
+            "last_observed_counters": [side_lost] * 6,
+            "events": [
+                {"event": "held", "state_held": True} for _ in range(held_count)
+            ],
         }
 
+    left = side(lost, resets, divergence)
+    right = side(0, 0, 0)
+    total_held = left["held_sample_count"] + right["held_sample_count"]
     return {
         "schema_version": 1,
         "metric": "inspire_dfx_motor_state_lost_counter",
+        "definition": (
+            "Per-side DFX read failures inferred from six identical "
+            "MotorState.lost counters; q is held on increments, counter "
+            "regressions, divergent counters, and baseline samples"
+        ),
+        "window_duration_s": 1.0,
         "malformed_message_count": malformed,
-        "left": side(lost, resets, divergence),
-        "right": side(0, 0, 0),
+        "malformed_messages": [
+            {"offset_s": 0.1, "error": "bad sample"} for _ in range(malformed)
+        ],
+        "left": left,
+        "right": right,
         "total_drop_event_count": int(lost > 0),
         "total_lost_increment_count": lost,
         "total_reset_count": resets,
+        "total_held_sample_count": total_held,
+        "any_state_held": total_held > 0,
+        "any_anomaly": bool(lost or resets or malformed),
     }
 
 
 def _inspire_contract(protocol):
-    return {"type": "inspire", "protocol": protocol}
+    return {
+        "schema_version": 1,
+        "type": "inspire",
+        "protocol": protocol,
+        "hand_dof": 6,
+        "value_unit": "normalized_open_fraction",
+        "value_range": [0.0, 1.0],
+        "zero_semantics": "fully_closed",
+        "one_semantics": "fully_open",
+        "left_joint_names": _LEFT_INSPIRE_NAMES,
+        "right_joint_names": _RIGHT_INSPIRE_NAMES,
+        "canonical_order": "left_then_right",
+    }
+
+
+def _inspire_info(protocol):
+    return {
+        "end_effector": _inspire_contract(protocol),
+        "joint_names": {
+            "left_ee": _LEFT_INSPIRE_NAMES,
+            "right_ee": _RIGHT_INSPIRE_NAMES,
+        },
+    }
 
 
 def _write_episode(task_dir, episode_name, document, *, add_data=True):
@@ -83,7 +179,11 @@ def _write_episode(task_dir, episode_name, document, *, add_data=True):
     if add_data and "data" not in document:
         timing = document.get("timing", {})
         frame_count = timing.get("frame_count", 0)
-        document["data"] = [{} for _ in range(frame_count)]
+        measured_fps = timing.get("measured_fps", 30.0)
+        document["data"] = [
+            {"idx": index, "timestamp_s": 0.01 + index / measured_fps}
+            for index in range(frame_count)
+        ]
     path.write_text(json.dumps(document), encoding="utf-8")
     return path
 
@@ -111,7 +211,7 @@ class TestEpisodeQualityClassification(unittest.TestCase):
                 Path(temp_dir),
                 "episode_0001",
                 {
-                    "info": {"end_effector": _inspire_contract("ftp")},
+                    "info": _inspire_info("ftp"),
                     "timing": _timing(),
                     "diagnostics": {
                         "inspire_ftp_state_subscribers": _dds(protocol="ftp")
@@ -130,7 +230,7 @@ class TestEpisodeQualityClassification(unittest.TestCase):
                 Path(temp_dir),
                 "episode_0002",
                 {
-                    "info": {"end_effector": _inspire_contract("dfx")},
+                    "info": _inspire_info("dfx"),
                     "timing": _timing(),
                     "diagnostics": {
                         "inspire_dfx_state_subscribers": _dds(combined=0),
@@ -163,7 +263,7 @@ class TestEpisodeQualityClassification(unittest.TestCase):
                     Path(temp_dir),
                     f"episode_{index:04d}",
                     {
-                        "info": {"end_effector": _inspire_contract("dfx")},
+                        "info": _inspire_info("dfx"),
                         "timing": _timing(),
                         "diagnostics": {
                             "inspire_dfx_state_subscribers": _dds(combined=0),
@@ -199,7 +299,7 @@ class TestEpisodeQualityClassification(unittest.TestCase):
                     Path(temp_dir),
                     f"episode_{index:04d}",
                     {
-                        "info": {"end_effector": _inspire_contract(protocol)},
+                        "info": _inspire_info(protocol),
                         "timing": _timing(),
                         "diagnostics": diagnostics,
                     },
@@ -289,7 +389,7 @@ class TestEpisodeQualityClassification(unittest.TestCase):
                 protocol = "dfx" if "inspire_dfx_lost_counters" in diagnostics else None
                 document = {"timing": _timing(), "diagnostics": diagnostics}
                 if protocol:
-                    document["info"] = {"end_effector": _inspire_contract(protocol)}
+                    document["info"] = _inspire_info(protocol)
                 path = _write_episode(
                     Path(temp_dir),
                     f"episode_{index:04d}",
@@ -326,7 +426,7 @@ class TestEpisodeQualityClassification(unittest.TestCase):
             ):
                 document = {"timing": _timing(), "diagnostics": diagnostics}
                 if protocol:
-                    document["info"] = {"end_effector": _inspire_contract(protocol)}
+                    document["info"] = _inspire_info(protocol)
                 path = _write_episode(
                     Path(temp_dir),
                     f"episode_{index:04d}",
@@ -400,7 +500,7 @@ class TestEpisodeQualityClassification(unittest.TestCase):
                     Path(temp_dir),
                     f"episode_{index:04d}",
                     {
-                        "info": {"end_effector": _inspire_contract("dfx")},
+                        "info": _inspire_info("dfx"),
                         "timing": _timing(),
                         "diagnostics": {
                             "inspire_dfx_state_subscribers": _dds(combined=0),
@@ -411,6 +511,188 @@ class TestEpisodeQualityClassification(unittest.TestCase):
                 result = classify_episode(path)
 
             self.assertEqual(result.status, "unknown")
+
+    def test_frame_timestamps_are_required_and_cross_checked(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            mismatched = _write_episode(
+                root,
+                "episode_0010",
+                {
+                    "timing": _timing(),
+                    "diagnostics": {"dex3_state_subscribers": _dds()},
+                },
+            )
+            mismatched_document = json.loads(mismatched.read_text(encoding="utf-8"))
+            mismatched_document["data"][1]["timestamp_s"] += 0.01
+            mismatched.write_text(json.dumps(mismatched_document), encoding="utf-8")
+
+            missing = _write_episode(
+                root,
+                "episode_0011",
+                {
+                    "timing": _timing(),
+                    "diagnostics": {"dex3_state_subscribers": _dds()},
+                },
+            )
+            missing_document = json.loads(missing.read_text(encoding="utf-8"))
+            missing_document["data"][1].pop("timestamp_s")
+            missing.write_text(json.dumps(missing_document), encoding="utf-8")
+
+            mismatched_result = classify_episode(mismatched)
+            missing_result = classify_episode(missing)
+
+        self.assertEqual(mismatched_result.status, "reject")
+        self.assertTrue(
+            any("_mismatch:timing=" in reason for reason in mismatched_result.reasons)
+        )
+        self.assertEqual(missing_result.status, "unknown")
+        self.assertTrue(
+            any(
+                reason.startswith("frame_timestamp_missing_or_invalid:")
+                for reason in missing_result.reasons
+            )
+        )
+
+    def test_timing_and_inspire_provenance_must_match_producer(self):
+        cases = []
+        missing_target = _timing()
+        missing_target.pop("target_fps")
+        cases.append((missing_target, _inspire_info("ftp")))
+
+        boolean_schema = _inspire_info("ftp")
+        boolean_schema["end_effector"]["schema_version"] = True
+        cases.append((_timing(), boolean_schema))
+
+        wrong_joint_names = _inspire_info("ftp")
+        wrong_joint_names["joint_names"]["left_ee"] = ["wrong"] * 6
+        cases.append((_timing(), wrong_joint_names))
+
+        for index, (timing, info) in enumerate(cases):
+            with self.subTest(index=index), tempfile.TemporaryDirectory() as temp_dir:
+                path = _write_episode(
+                    Path(temp_dir),
+                    f"episode_{index:04d}",
+                    {
+                        "info": info,
+                        "timing": timing,
+                        "diagnostics": {
+                            "inspire_ftp_state_subscribers": _dds(protocol="ftp")
+                        },
+                    },
+                )
+                result = classify_episode(path)
+
+            self.assertEqual(result.status, "unknown")
+
+    def test_dds_internal_accounting_cannot_false_clean(self):
+        cases = []
+        hidden_event = _dds()
+        hidden_event["left"]["gaps"] = [
+            {
+                "start_offset_s": 0.1,
+                "end_offset_s": 0.2,
+                "duration_s": 0.1,
+                "recovered": True,
+            }
+        ]
+        cases.append(hidden_event)
+        bad_open_flag = _dds()
+        bad_open_flag["left"]["open_gap_at_end"] = True
+        cases.append(bad_open_flag)
+        missing_detail = _dds()
+        missing_detail["left"].pop("recovered_gap_count")
+        cases.append(missing_detail)
+
+        for index, dds in enumerate(cases):
+            with self.subTest(index=index), tempfile.TemporaryDirectory() as temp_dir:
+                path = _write_episode(
+                    Path(temp_dir),
+                    f"episode_{index:04d}",
+                    {
+                        "timing": _timing(),
+                        "diagnostics": {"dex3_state_subscribers": dds},
+                    },
+                )
+                result = classify_episode(path)
+
+            self.assertEqual(result.status, "unknown")
+
+    def test_dfx_held_and_internal_accounting_cannot_false_clean(self):
+        held = _dfx_lost()
+        held["left"].update(
+            {
+                "baseline_count": 1,
+                "accepted_count": 2,
+                "held_sample_count": 1,
+                "events": [{"event": "baseline", "state_held": True}],
+            }
+        )
+        held["total_held_sample_count"] = 1
+        held["any_state_held"] = True
+
+        inconsistent = _dfx_lost()
+        inconsistent["any_state_held"] = True
+
+        for index, (lost_metrics, expected_status) in enumerate(
+            ((held, "reject"), (inconsistent, "unknown"))
+        ):
+            with self.subTest(index=index), tempfile.TemporaryDirectory() as temp_dir:
+                path = _write_episode(
+                    Path(temp_dir),
+                    f"episode_{index:04d}",
+                    {
+                        "info": _inspire_info("dfx"),
+                        "timing": _timing(),
+                        "diagnostics": {
+                            "inspire_dfx_state_subscribers": _dds(combined=0),
+                            "inspire_dfx_lost_counters": lost_metrics,
+                        },
+                    },
+                )
+                result = classify_episode(path)
+
+            self.assertEqual(result.status, expected_status)
+
+    def test_conflicting_hand_sources_are_unknown_but_unrelated_gaps_are_ignored(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            conflicting = _write_episode(
+                root,
+                "episode_0012",
+                {
+                    "info": _inspire_info("ftp"),
+                    "timing": _timing(),
+                    "diagnostics": {
+                        "inspire_ftp_state_subscribers": _dds(protocol="ftp"),
+                        "inspire_dfx_lost_counters": _dfx_lost(),
+                    },
+                },
+            )
+            unrelated = _write_episode(
+                root,
+                "episode_0013",
+                {
+                    "timing": _timing(),
+                    "diagnostics": {
+                        "dex3_state_subscribers": _dds(),
+                        "camera_health": {"gap_count": 9},
+                    },
+                },
+            )
+
+            conflicting_result = classify_episode(conflicting)
+            unrelated_result = classify_episode(unrelated)
+
+        self.assertEqual(conflicting_result.status, "unknown")
+        self.assertTrue(
+            any(
+                reason.startswith("hand_diagnostic_source_set_mismatch:")
+                for reason in conflicting_result.reasons
+            )
+        )
+        self.assertEqual(unrelated_result.status, "clean")
+        self.assertEqual(unrelated_result.dds_gap_count, 0)
 
     def test_frame_count_is_required_and_mismatch_rejects(self):
         with tempfile.TemporaryDirectory() as temp_dir:

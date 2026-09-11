@@ -235,7 +235,7 @@ New recordings save top-level `timing` and `diagnostics` summaries in each
 or changing any episode:
 
 ```bash
-cd ~/xr_teleoperate
+cd ~/Development/xr_teleoperate
 python -m teleop.utils.episode_quality \
   teleop/utils/data/stack_three_cups_09_11 \
   --max-frame-gap-s 0.075 \
