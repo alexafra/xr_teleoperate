@@ -95,6 +95,8 @@ if __name__ == '__main__':
     parser.add_argument('--task-steps', type = str, default = 'step1: do this; step2: do that;', help = 'task steps for recording at json file')
 
     args = parser.parse_args()
+    if args.ee in ("inspire_dfx", "inspire_ftp") and args.input_mode != "hand":
+        parser.error(f"--ee {args.ee} requires --input-mode hand")
     logger_mp.info(f"args: {args}")
 
     try:
@@ -158,6 +160,11 @@ if __name__ == '__main__':
             arm_ctrl = H1_ArmController(simulation_mode=args.sim)
 
         # end-effector
+        hand_ctrl = None
+        inspire_end_effector_info = None
+        inspire_xr_motion_data_ready = None
+        if args.ee in ("inspire_dfx", "inspire_ftp"):
+            inspire_xr_motion_data_ready = Value('b', False, lock=True)
         if args.ee == "dex3":
             from teleop.robot_control.robot_hand_unitree import Dex3_1_Controller
             left_hand_pos_array = Array('d', 75, lock = True)      # [input]
@@ -177,21 +184,47 @@ if __name__ == '__main__':
             gripper_ctrl = Dex1_1_Gripper_Controller(left_gripper_value, right_gripper_value, dual_gripper_data_lock, 
                                                      dual_gripper_state_array, dual_gripper_action_array, simulation_mode=args.sim)
         elif args.ee == "inspire_dfx":
-            from teleop.robot_control.robot_hand_inspire import Inspire_Controller_DFX
+            from teleop.robot_control.robot_hand_inspire import (
+                Inspire_Controller_DFX,
+                get_inspire_end_effector_info,
+                inspire_xr_hand_data_is_ready,
+            )
             left_hand_pos_array = Array('d', 75, lock = True)      # [input]
             right_hand_pos_array = Array('d', 75, lock = True)     # [input]
             dual_hand_data_lock = Lock()
             dual_hand_state_array = Array('d', 12, lock = False)   # [output] current left, right hand state(12) data.
             dual_hand_action_array = Array('d', 12, lock = False)  # [output] current left, right hand action(12) data.
-            hand_ctrl = Inspire_Controller_DFX(left_hand_pos_array, right_hand_pos_array, dual_hand_data_lock, dual_hand_state_array, dual_hand_action_array, simulation_mode=args.sim)
+            hand_ctrl = Inspire_Controller_DFX(
+                left_hand_pos_array,
+                right_hand_pos_array,
+                dual_hand_data_lock,
+                dual_hand_state_array,
+                dual_hand_action_array,
+                simulation_mode=args.sim,
+                xr_motion_data_ready_in=inspire_xr_motion_data_ready,
+            )
+            inspire_end_effector_info = get_inspire_end_effector_info("dfx")
         elif args.ee == "inspire_ftp":
-            from teleop.robot_control.robot_hand_inspire import Inspire_Controller_FTP
+            from teleop.robot_control.robot_hand_inspire import (
+                Inspire_Controller_FTP,
+                get_inspire_end_effector_info,
+                inspire_xr_hand_data_is_ready,
+            )
             left_hand_pos_array = Array('d', 75, lock = True)      # [input]
             right_hand_pos_array = Array('d', 75, lock = True)     # [input]
             dual_hand_data_lock = Lock()
             dual_hand_state_array = Array('d', 12, lock = False)   # [output] current left, right hand state(12) data.
             dual_hand_action_array = Array('d', 12, lock = False)  # [output] current left, right hand action(12) data.
-            hand_ctrl = Inspire_Controller_FTP(left_hand_pos_array, right_hand_pos_array, dual_hand_data_lock, dual_hand_state_array, dual_hand_action_array, simulation_mode=args.sim)
+            hand_ctrl = Inspire_Controller_FTP(
+                left_hand_pos_array,
+                right_hand_pos_array,
+                dual_hand_data_lock,
+                dual_hand_state_array,
+                dual_hand_action_array,
+                simulation_mode=args.sim,
+                xr_motion_data_ready_in=inspire_xr_motion_data_ready,
+            )
+            inspire_end_effector_info = get_inspire_end_effector_info("ftp")
         elif args.ee == "brainco":
             from teleop.robot_control.robot_hand_brainco import Brainco_Controller
             left_hand_pos_array = Array('d', 75, lock = True)      # [input]
@@ -234,6 +267,26 @@ if __name__ == '__main__':
         if args.record:
             head_config = camera_config["head_camera"]
 
+            episode_diagnostics_sources = {}
+            subscriber_drop_tracker = getattr(
+                hand_ctrl,
+                "subscriber_drop_tracker",
+                None,
+            )
+            if subscriber_drop_tracker is not None:
+                episode_diagnostics_sources[
+                    f"{args.ee}_state_subscribers"
+                ] = subscriber_drop_tracker
+            lost_counter_tracker = getattr(
+                hand_ctrl,
+                "lost_counter_tracker",
+                None,
+            )
+            if lost_counter_tracker is not None:
+                episode_diagnostics_sources[
+                    f"{args.ee}_lost_counters"
+                ] = lost_counter_tracker
+
             depth_scale = None
             if head_config.get("enable_depth", False):
                 depth_scale = head_config[
@@ -245,7 +298,9 @@ if __name__ == '__main__':
                                      task_steps = args.task_steps,
                                      frequency = args.frequency, 
                                      rerun_log = not args.headless,
-                                     depth_scale_m_per_unit=depth_scale,)
+                                     depth_scale_m_per_unit=depth_scale,
+                                     episode_diagnostics_sources=episode_diagnostics_sources,
+                                     end_effector_info=inspire_end_effector_info,)
 
         logger_mp.info("----------------------------------------------------------------")
         logger_mp.info("🟢  Press [r] to start syncing the robot with your movements.")
@@ -328,6 +383,15 @@ if __name__ == '__main__':
                     right_gripper_value.value = tele_data.right_hand_pinchValue
             else:
                 pass
+            if inspire_xr_motion_data_ready is not None:
+                xr_ready = getattr(tele_data, "motion_data_ready", None)
+                if xr_ready is None:
+                    xr_ready = inspire_xr_hand_data_is_ready(
+                        tele_data.left_hand_pos,
+                        tele_data.right_hand_pos,
+                    )
+                with inspire_xr_motion_data_ready.get_lock():
+                    inspire_xr_motion_data_ready.value = bool(xr_ready)
             
             # high level control
             if args.input_mode == "controller" and args.motion:
@@ -518,6 +582,14 @@ if __name__ == '__main__':
         import traceback
         logger_mp.error(traceback.format_exc())
     finally:
+        try:
+            if args.record and not recorder.is_ready():
+                # Freeze episode timing and subscriber diagnostics before any
+                # shutdown homing or queue-drain delay.
+                recorder.save_episode()
+        except Exception as e:
+            logger_mp.error(f"Failed to stop active recording: {e}")
+
         try:
             arm_ctrl.ctrl_dual_arm_go_home()
         except Exception as e:

@@ -2,6 +2,7 @@ import os
 import cv2
 import json
 import datetime
+import copy
 import numpy as np
 import time
 from .rerun_visualizer import RerunLogger
@@ -11,7 +12,7 @@ import logging_mp
 logger_mp = logging_mp.getLogger(__name__)
 
 class EpisodeWriter():
-    def __init__(self, task_dir, task_goal=None, task_desc = None, task_steps = None, frequency=30, image_size=[640, 480], rerun_log = True, depth_scale_m_per_unit=None):
+    def __init__(self, task_dir, task_goal=None, task_desc = None, task_steps = None, frequency=30, image_size=[640, 480], rerun_log = True, depth_scale_m_per_unit=None, episode_diagnostics_sources=None, end_effector_info=None):
         """
         image_size: [width, height]
         """
@@ -47,6 +48,12 @@ class EpisodeWriter():
             )
 
         self.rerun_log = rerun_log
+        if end_effector_info is not None and not isinstance(end_effector_info, dict):
+            raise TypeError("end_effector_info must be a dictionary or None")
+        self.end_effector_info = copy.deepcopy(end_effector_info)
+        self.episode_diagnostics_sources = dict(episode_diagnostics_sources or {})
+        self.episode_diagnostics = {}
+        self.active_episode_diagnostics_sources = {}
         if self.rerun_log:
             logger_mp.info("==> RerunLogger initializing...\n")
             self.rerun_logger = RerunLogger(prefix="online/", IdxRangeBoundary = 60, memory_limit = "300MB")
@@ -121,6 +128,14 @@ class EpisodeWriter():
                 }, 
                 "sim_state": ""
             }
+        if self.end_effector_info is not None:
+            self.info["end_effector"] = copy.deepcopy(self.end_effector_info)
+            self.info["joint_names"]["left_ee"] = list(
+                self.end_effector_info.get("left_joint_names", [])
+            )
+            self.info["joint_names"]["right_ee"] = list(
+                self.end_effector_info.get("right_joint_names", [])
+            )
 
  
     def create_episode(self):
@@ -174,6 +189,21 @@ class EpisodeWriter():
             f.write('"text": ' + json.dumps(self.text, ensure_ascii=False, indent=4) + ',\n')
             f.write('"data": [\n')
         self.first_item = True   # Flag to handle commas in JSON array
+
+        self.episode_diagnostics = {}
+        self.active_episode_diagnostics_sources = {}
+        for name, source in self.episode_diagnostics_sources.items():
+            try:
+                source.begin_episode_window()
+                self.active_episode_diagnostics_sources[name] = source
+            except Exception as error:
+                logger_mp.error(
+                    f"Failed to start episode diagnostic {name}: {error}"
+                )
+                self.episode_diagnostics[name] = {
+                    "available": False,
+                    "error": str(error),
+                }
 
         if self.rerun_log:
             self.online_logger = RerunLogger(prefix="online/", IdxRangeBoundary = 60, memory_limit="300MB")
@@ -315,6 +345,20 @@ class EpisodeWriter():
             datetime.timezone.utc
         ).isoformat()
         #time end
+        for name, source in self.active_episode_diagnostics_sources.items():
+            try:
+                self.episode_diagnostics[name] = copy.deepcopy(
+                    source.finish_episode_window()
+                )
+            except Exception as error:
+                logger_mp.error(
+                    f"Failed to finish episode diagnostic {name}: {error}"
+                )
+                self.episode_diagnostics[name] = {
+                    "available": False,
+                    "error": str(error),
+                }
+        self.active_episode_diagnostics_sources = {}
         self.need_save = True  # Set the save flag
         logger_mp.info(f"==> Episode saved start...")
 
@@ -385,6 +429,16 @@ class EpisodeWriter():
                     indent=4,
                 )
             )
+            if self.episode_diagnostics:
+                f.write(",\n")
+                f.write(
+                    '"diagnostics": '
+                    + json.dumps(
+                        self.episode_diagnostics,
+                        ensure_ascii=False,
+                        indent=4,
+                    )
+                )
             f.write("\n}")
         #timing end
         self.need_save = False     # Reset the save flag
@@ -399,9 +453,9 @@ class EpisodeWriter():
         """
         Stop the worker thread and ensure all tasks are completed.
         """
-        self.item_data_queue.join()
         if not self.is_available:  # If self.is_available is False, it means there is still data not saved.
             self.save_episode()
+        self.item_data_queue.join()
         while not self.is_available:
             time.sleep(0.01)
         self.stop_worker = True

@@ -18,6 +18,7 @@ from multiprocessing import Process, Array, Value, Lock
 parent2_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(parent2_dir)
 from teleop.robot_control.hand_retargeting import HandRetargeting, HandType
+from teleop.utils.subscriber_drop_tracker import SubscriberDropTracker
 from teleop.utils.weighted_moving_filter import WeightedMovingFilter
 
 import logging_mp
@@ -29,6 +30,27 @@ kTopicDex3LeftCommand = "rt/dex3/left/cmd"
 kTopicDex3RightCommand = "rt/dex3/right/cmd"
 kTopicDex3LeftState = "rt/dex3/left/state"
 kTopicDex3RightState = "rt/dex3/right/state"
+DEX3_SUBSCRIBER_GAP_THRESHOLD_S = 0.075
+
+
+class Dex3SubscriberDropTracker(SubscriberDropTracker):
+    """Track per-hand state receive gaps inside a recording window."""
+
+    _SIDES = ("left", "right")
+    _TOPICS = {
+        "left": kTopicDex3LeftState,
+        "right": kTopicDex3RightState,
+    }
+
+    def __init__(self, gap_threshold_s=DEX3_SUBSCRIBER_GAP_THRESHOLD_S, clock_ns=None):
+        super().__init__(
+            self._TOPICS,
+            gap_threshold_s,
+            clock_ns,
+            stream_label="Dex3 hand side",
+            window_label="Dex3 subscriber diagnostics",
+            aggregate_count_key="total_side_gap_count",
+        )
 
 
 class Dex3_1_Controller:
@@ -77,11 +99,35 @@ class Dex3_1_Controller:
         # Shared Arrays for hand states
         self.left_hand_state_array  = Array('d', Dex3_Num_Motors, lock=True)  
         self.right_hand_state_array = Array('d', Dex3_Num_Motors, lock=True)
+        self.subscriber_drop_tracker = Dex3SubscriberDropTracker()
 
-        # initialize subscribe thread
-        self.subscribe_state_thread = threading.Thread(target=self._subscribe_hand_state)
-        self.subscribe_state_thread.daemon = True
-        self.subscribe_state_thread.start()
+        # Read each hand on its own thread. ChannelSubscriber.Read() blocks until
+        # that topic produces a sample, so a shared reader thread would let a
+        # dropout on either hand prevent the healthy hand from being refreshed.
+        self.left_subscribe_state_thread = threading.Thread(
+            target=self._subscribe_hand_state,
+            args=(
+                self.LeftHandState_subscriber,
+                self.left_hand_state_array,
+                Dex3_1_Left_JointIndex,
+                "left",
+            ),
+            name="dex3-left-state",
+            daemon=True,
+        )
+        self.right_subscribe_state_thread = threading.Thread(
+            target=self._subscribe_hand_state,
+            args=(
+                self.RightHandState_subscriber,
+                self.right_hand_state_array,
+                Dex3_1_Right_JointIndex,
+                "right",
+            ),
+            name="dex3-right-state",
+            daemon=True,
+        )
+        self.left_subscribe_state_thread.start()
+        self.right_subscribe_state_thread.start()
 
         while True:
             if any(self.left_hand_state_array) and any(self.right_hand_state_array):
@@ -97,17 +143,20 @@ class Dex3_1_Controller:
 
         logger_mp.info("Initialize Dex3_1_Controller OK!")
 
-    def _subscribe_hand_state(self):
+    def _subscribe_hand_state(self, subscriber, state_array, joint_indices, side):
         while True:
-            left_hand_msg  = self.LeftHandState_subscriber.Read()
-            right_hand_msg = self.RightHandState_subscriber.Read()
-            if left_hand_msg is not None and right_hand_msg is not None:
-                # Update left hand state
-                for idx, id in enumerate(Dex3_1_Left_JointIndex):
-                    self.left_hand_state_array[idx] = left_hand_msg.motor_state[id].q
-                # Update right hand state
-                for idx, id in enumerate(Dex3_1_Right_JointIndex):
-                    self.right_hand_state_array[idx] = right_hand_msg.motor_state[id].q
+            hand_msg = subscriber.Read()
+            if hand_msg is not None:
+                received_ns = time.monotonic_ns()
+                state = [hand_msg.motor_state[id].q for id in joint_indices]
+                try:
+                    self.subscriber_drop_tracker.observe(side, received_ns)
+                except Exception as error:
+                    logger_mp.error(
+                        f"[{side} Dex3 state] Failed to record subscriber diagnostics: {error}"
+                    )
+                with state_array.get_lock():
+                    state_array[:] = state
             time.sleep(0.002)
     
     class _RIS_Mode:
