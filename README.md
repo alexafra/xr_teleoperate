@@ -112,6 +112,11 @@ The currently supported devices in this repository:
 
 We tested our code on Ubuntu 20.04 and Ubuntu 22.04, other operating systems may be configured differently. This document primarily describes the **default mode**.
 
+To reproduce the known-good RGB-D image server on a replacement robot, follow
+[the pinned new-robot TeleImager procedure](NEW_ROBOT_IMAGE_SERVER.md). It keeps
+the original stream contract and changes only the RealSense serial number after
+hardware validation.
+
 For more information, you can refer to [Official Documentation ](https://support.unitree.com/home/zh/Teleoperation) and [OpenTeleVision](https://github.com/OpenTeleVision/TeleVision).
 
 ## 1.1 📥 basic
