@@ -212,7 +212,17 @@ class EpisodeWriter():
         logger_mp.info(f"==> New episode created: {self.episode_dir}")
         return True  # Return True if the episode is successfully created
         
-    def add_item(self, colors, depths=None, states=None, actions=None, tactiles=None, audios=None, sim_state=None):
+    def add_item(
+        self,
+        colors,
+        depths=None,
+        states=None,
+        actions=None,
+        tactiles=None,
+        audios=None,
+        sim_state=None,
+        rgbd_pairing=None,
+    ):
         #add time
         if self.episode_start_monotonic is None:
             raise RuntimeError(
@@ -257,6 +267,10 @@ class EpisodeWriter():
             'audios': audios,
             'sim_state': sim_state,
         }
+        if rgbd_pairing is not None:
+            if not isinstance(rgbd_pairing, dict):
+                raise TypeError("rgbd_pairing must be a dictionary or None")
+            item_data['rgbd_pairing'] = copy.deepcopy(rgbd_pairing)
         # Enqueue the item data
         self.item_data_queue.put(item_data)
 

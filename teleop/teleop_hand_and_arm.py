@@ -20,6 +20,11 @@ from teleimager.image_client import ImageClient
 from teleop.utils.episode_writer import EpisodeWriter
 from teleop.utils.ipc import IPC_Server
 from teleop.utils.motion_switcher import MotionSwitcher, LocoClientWrapper
+from teleop.utils.rgbd_capture import (
+    EXPERIMENTAL_ATOMIC_RGBD_RECORDING,
+    PreferAtomicHeadRgbdCapture,
+    should_prefer_atomic_rgbd_recording,
+)
 from sshkeyboard import listen_keyboard, stop_listening
 
 # for simulation
@@ -121,6 +126,26 @@ if __name__ == '__main__':
         img_client = ImageClient(host=args.img_server_ip, request_bgr=True)
         camera_config = img_client.get_cam_config()
         logger_mp.debug(f"Camera config: {camera_config}")
+        head_config = camera_config["head_camera"]
+        rgbd_capture = None
+        if should_prefer_atomic_rgbd_recording(
+            recording_enabled=args.record,
+            end_effector=args.ee,
+            head_config=head_config,
+            experimental_opt_in=EXPERIMENTAL_ATOMIC_RGBD_RECORDING,
+        ):
+            try:
+                from teleimager.image_client import decode_rgbd_frame
+            except Exception:
+                # Older TeleImager clients remain supported through the
+                # helper's legacy fallback path.
+                decode_rgbd_frame = None
+            rgbd_capture = PreferAtomicHeadRgbdCapture(
+                img_client,
+                head_config,
+                decode_atomic_frame=decode_rgbd_frame,
+                logger=logger_mp,
+            )
         xr_need_local_img = not (args.display_mode == 'pass-through' or camera_config['head_camera']['enable_webrtc'])
 
         # televuer_wrapper: obtain hand pose data from the XR device and transmit the robot's head camera image to the XR device.
@@ -265,8 +290,6 @@ if __name__ == '__main__':
 
         # record + headless / non-headless mode
         if args.record:
-            head_config = camera_config["head_camera"]
-
             episode_diagnostics_sources = {}
             subscriber_drop_tracker = getattr(
                 hand_ctrl,
@@ -301,6 +324,8 @@ if __name__ == '__main__':
                                      depth_scale_m_per_unit=depth_scale,
                                      episode_diagnostics_sources=episode_diagnostics_sources,
                                      end_effector_info=inspire_end_effector_info,)
+            if rgbd_capture is not None:
+                recorder.info["rgbd_pairing"] = rgbd_capture.episode_metadata()
 
         logger_mp.info("----------------------------------------------------------------")
         logger_mp.info("🟢  Press [r] to start syncing the robot with your movements.")
@@ -313,7 +338,15 @@ if __name__ == '__main__':
         READY = True                  # now ready to (1) enter START state
         while not START and not STOP: # wait for start or stop signal.
             time.sleep(0.033)
-            if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
+            if rgbd_capture is not None:
+                preview_rgbd = rgbd_capture.read()
+                if (
+                    xr_need_local_img
+                    and preview_rgbd is not None
+                    and preview_rgbd.color_bgr is not None
+                ):
+                    tv_wrapper.render_to_xr(preview_rgbd.color_bgr)
+            elif camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
                 head_img = img_client.get_head_frame()
                 tv_wrapper.render_to_xr(head_img.bgr)
 
@@ -325,15 +358,28 @@ if __name__ == '__main__':
 
         while not STOP:
             start_time = time.time()
+            head_img = None
+            record_head_bgr = None
+            rgbd_pairing = None
             # get image
-            if camera_config['head_camera']['enable_zmq']:
+            if rgbd_capture is not None:
+                rgbd_sample = rgbd_capture.read()
+                record_head_bgr = rgbd_sample.color_bgr
+                head_depth = rgbd_sample.aligned_depth
+                rgbd_pairing = rgbd_sample.pairing
+                if xr_need_local_img and record_head_bgr is not None:
+                    tv_wrapper.render_to_xr(record_head_bgr)
+            elif camera_config['head_camera']['enable_zmq']:
                 if args.record or xr_need_local_img:
                     head_img = img_client.get_head_frame()
+                    if args.record and head_img is not None:
+                        record_head_bgr = head_img.bgr
                 if xr_need_local_img:
                     tv_wrapper.render_to_xr(head_img.bgr)
                     # tv_wrapper.render_to_xr(head_img)
             if (args.record and camera_config["head_camera"].get("enable_depth", False)):
-                head_depth = img_client.get_head_depth_frame()
+                if rgbd_capture is None:
+                    head_depth = img_client.get_head_depth_frame()
 
                 if camera_config["head_camera"].get("raw_depth_zmq_port") is not None:
                     head_raw_depth = img_client.get_head_raw_depth_frame()
@@ -484,9 +530,9 @@ if __name__ == '__main__':
                             else:
                                 logger_mp.warning("Head raw-depth image is None!")
                     if camera_config['head_camera']['binocular']:
-                        if head_img is not None:
-                            colors[f"color_{0}"] = head_img.bgr[:, :camera_config['head_camera']['image_shape'][1]//2]
-                            colors[f"color_{1}"] = head_img.bgr[:, camera_config['head_camera']['image_shape'][1]//2:]
+                        if record_head_bgr is not None:
+                            colors[f"color_{0}"] = record_head_bgr[:, :camera_config['head_camera']['image_shape'][1]//2]
+                            colors[f"color_{1}"] = record_head_bgr[:, camera_config['head_camera']['image_shape'][1]//2:]
                         else:
                             logger_mp.warning("Head image is None!")
                         if camera_config['left_wrist_camera']['enable_zmq']:
@@ -500,8 +546,8 @@ if __name__ == '__main__':
                             else:
                                 logger_mp.warning("Right wrist image is None!")
                     else:
-                        if head_img is not None:
-                            colors[f"color_{0}"] = head_img.bgr
+                        if record_head_bgr is not None:
+                            colors[f"color_{0}"] = record_head_bgr
                         else:
                             logger_mp.warning("Head image is None!")
                         if camera_config['left_wrist_camera']['enable_zmq']:
@@ -566,9 +612,9 @@ if __name__ == '__main__':
                     }
                     if args.sim:
                         sim_state = sim_state_subscriber.read_data()            
-                        recorder.add_item(colors=colors, depths=depths, states=states, actions=actions, sim_state=sim_state)
+                        recorder.add_item(colors=colors, depths=depths, states=states, actions=actions, sim_state=sim_state, rgbd_pairing=rgbd_pairing)
                     else:
-                        recorder.add_item(colors=colors, depths=depths, states=states, actions=actions)
+                        recorder.add_item(colors=colors, depths=depths, states=states, actions=actions, rgbd_pairing=rgbd_pairing)
 
             current_time = time.time()
             time_elapsed = current_time - start_time

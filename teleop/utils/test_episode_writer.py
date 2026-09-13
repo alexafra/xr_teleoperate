@@ -23,6 +23,43 @@ class _FakeDiagnosticsSource:
 
 
 class TestEpisodeWriterDiagnostics(unittest.TestCase):
+    def test_rgbd_pairing_provenance_is_saved_per_frame(self):
+        pairing = {
+            "schema_version": 1,
+            "mode": "atomic",
+            "paired": True,
+            "protocol": "teleimager-rgbd-v1",
+            "capture_sequence": 42,
+            "server_capture_monotonic_ns": 1234,
+            "client_received_monotonic_ns": 5678,
+            "raw_depth_pairing": "independent_legacy_stream",
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            task_dir = Path(temp_dir) / "episodes"
+            writer = EpisodeWriter(task_dir=str(task_dir), rerun_log=False)
+            self.assertTrue(writer.create_episode())
+            writer.add_item(colors={}, depths={}, rgbd_pairing=pairing)
+            writer.close()
+            saved = json.loads(
+                (task_dir / "episode_0000" / "data.json").read_text()
+            )
+
+        self.assertEqual(saved["data"][0]["rgbd_pairing"], pairing)
+
+    def test_legacy_call_omits_rgbd_field(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            task_dir = Path(temp_dir) / "episodes"
+            writer = EpisodeWriter(task_dir=str(task_dir), rerun_log=False)
+            self.assertTrue(writer.create_episode())
+            writer.add_item(colors={}, depths={}, rgbd_pairing=None)
+            writer.close()
+            saved = json.loads(
+                (task_dir / "episode_0000" / "data.json").read_text()
+            )
+
+        self.assertNotIn("rgbd_pairing", saved["data"][0])
+
     def test_dfx_receive_and_lost_counter_diagnostics_are_both_saved(self):
         receive_source = _FakeDiagnosticsSource(
             {"combined": {"gap_count": 0}}
