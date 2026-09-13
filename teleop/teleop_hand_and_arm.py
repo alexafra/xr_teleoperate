@@ -103,6 +103,7 @@ if __name__ == '__main__':
     if args.ee in ("inspire_dfx", "inspire_ftp") and args.input_mode != "hand":
         parser.error(f"--ee {args.ee} requires --input-mode hand")
     logger_mp.info(f"args: {args}")
+    tactile_reader = None
 
     try:
         # setup dds communication domains id
@@ -290,6 +291,18 @@ if __name__ == '__main__':
 
         # record + headless / non-headless mode
         if args.record:
+            if args.ee == "inspire_ftp" and not args.sim:
+                from teleop.robot_control.inspire_tactile import (
+                    InspireTactileReader,
+                    TACTILE_PADS,
+                )
+
+                tactile_reader = InspireTactileReader()
+                if not tactile_reader.wait_for_data(timeout=3.0):
+                    raise RuntimeError(
+                        "Inspire FTP recording requires valid tactile data from both hands"
+                    )
+
             episode_diagnostics_sources = {}
             subscriber_drop_tracker = getattr(
                 hand_ctrl,
@@ -324,6 +337,9 @@ if __name__ == '__main__':
                                      depth_scale_m_per_unit=depth_scale,
                                      episode_diagnostics_sources=episode_diagnostics_sources,
                                      end_effector_info=inspire_end_effector_info,)
+            if tactile_reader is not None:
+                recorder.info["tactile_names"]["left_ee"] = list(TACTILE_PADS)
+                recorder.info["tactile_names"]["right_ee"] = list(TACTILE_PADS)
             if rgbd_capture is not None:
                 recorder.info["rgbd_pairing"] = rgbd_capture.episode_metadata()
 
@@ -610,11 +626,31 @@ if __name__ == '__main__':
                             "qpos": current_body_action,
                         }, 
                     }
+                    tactiles = (
+                        tactile_reader.get_tactiles()
+                        if tactile_reader is not None
+                        else None
+                    )
                     if args.sim:
-                        sim_state = sim_state_subscriber.read_data()            
-                        recorder.add_item(colors=colors, depths=depths, states=states, actions=actions, sim_state=sim_state, rgbd_pairing=rgbd_pairing)
+                        sim_state = sim_state_subscriber.read_data()
+                        recorder.add_item(
+                            colors=colors,
+                            depths=depths,
+                            states=states,
+                            actions=actions,
+                            tactiles=tactiles,
+                            sim_state=sim_state,
+                            rgbd_pairing=rgbd_pairing,
+                        )
                     else:
-                        recorder.add_item(colors=colors, depths=depths, states=states, actions=actions, rgbd_pairing=rgbd_pairing)
+                        recorder.add_item(
+                            colors=colors,
+                            depths=depths,
+                            states=states,
+                            actions=actions,
+                            tactiles=tactiles,
+                            rgbd_pairing=rgbd_pairing,
+                        )
 
             current_time = time.time()
             time_elapsed = current_time - start_time
@@ -679,5 +715,11 @@ if __name__ == '__main__':
                 recorder.close()
         except Exception as e:
             logger_mp.error(f"Failed to close recorder: {e}")
+
+        try:
+            if tactile_reader is not None:
+                tactile_reader.close()
+        except Exception as e:
+            logger_mp.error(f"Failed to close Inspire tactile reader: {e}")
         logger_mp.info("✅ Finally, exiting program.")
         exit(0)
