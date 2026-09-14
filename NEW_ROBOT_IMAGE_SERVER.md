@@ -159,11 +159,18 @@ for index, dev in enumerate(devices):
                 "height": intr.height,
                 "fx": intr.fx,
                 "fy": intr.fy,
-                "cx_ppx": intr.ppx,
-                "cy_ppy": intr.ppy,
-                "model": str(intr.model),
+                "cx": intr.ppx,
+                "cy": intr.ppy,
+                "distortion": str(intr.model),
                 "coeffs": list(intr.coeffs),
             })
+
+    color = wanted[(rs.stream.color, rs.format.bgr8)]
+    depth = wanted[(rs.stream.depth, rs.format.z16)]
+    if color is not None and depth is not None:
+        extr = depth.get_extrinsics_to(color)
+        print("  depth_to_color_rotation_sdk_order:", list(extr.rotation))
+        print("  depth_to_color_translation_m:", list(extr.translation))
 PY
 ```
 
@@ -205,10 +212,25 @@ The intended server contract remains:
 | WebRTC | disabled |
 | Wrist cameras | disabled |
 
-The full image server dynamically adds `depth_scale_m_per_unit` from the
-connected depth sensor to the configuration returned to clients. Do not use
-`realsense_zmq_publisher.py`; that helper is RGB-only and would not reproduce
-the recording contract above.
+The full image server reads the SDK depth scale and requires it to equal
+`0.001` at float32 precision. It advertises the exact canonical processing
+value as `depth_scale_m_per_unit: 0.001`; the SDK spelling is retained only as
+`depth_scale_reported_m_per_unit`. Processing must never use the reported
+field. The same live reply includes `calibration` with schema
+`realsense_rgbd_calibration.v1`: model, serial, product ID, firmware, active
+color/depth profiles and intrinsics, Depth-to-Color extrinsics, and a SHA-256
+fingerprint over canonical JSON.
+
+For the replacement-camera values recorded above, the expected fingerprint is
+`sha256:f7860e3e2be34af131e214c74d417217c889eff3a069dbec543be3fba15b027b`.
+
+During recording, Teleop copies `calibration` to
+`info.depth.calibration`, maps the reported field to
+`info.depth.scale_reported_m_per_unit`, and persists the exact processing value
+as `info.depth.scale_m_per_unit: 0.001`. A depth-enabled recorder fails closed
+when this metadata is missing or inconsistent. Color-only operation remains
+supported. Do not use `realsense_zmq_publisher.py`; that helper is RGB-only and
+would not reproduce the recording contract above.
 
 ## Foreground validation before autostart
 
@@ -228,10 +250,12 @@ cd "$HOME/teleimager-rgbd-v1.1"
 teleimager-server --rs
 ```
 
-Confirm that it initializes the selected serial at 640x480/30 and reports a
-positive depth scale. From the workstation, confirm that the configuration is
-received on port 60000 and that RGB, aligned depth, and raw depth all advance on
-ports 5555, 5558, and 5559 before enabling boot startup.
+Confirm that it initializes the selected serial at 640x480/30, accepts the SDK
+scale as canonical `0.001`, and logs both processing and reported scales. From
+the workstation, confirm that the configuration received on port 60000 has the
+active camera identity, full calibration, fingerprint, and exact canonical
+scale, and that RGB, aligned depth, and raw depth all advance on ports 5555,
+5558, and 5559 before enabling boot startup.
 
 The recent original-robot baseline was 683 RGB, 683 aligned-depth, and 683
 raw-depth frames at 29.85 Hz, with a depth scale near 0.001 metres per raw unit.
@@ -267,14 +291,20 @@ failure.
 
 ## Calibration boundary for surface-normal policies
 
-Changing only the serial is sufficient for the existing RGB, aligned-depth,
-and raw-depth transport. It does not make a physically different camera's
-optics identical. The current surface-normal preprocessing uses the original
-D435I color intrinsics (`fx=605.4215`, `fy=605.5905`, `ppx=321.8568`,
-`ppy=242.2497`) at 640x480.
+Changing only the serial is sufficient for transport, but not for geometric
+preprocessing. The replacement D435I (`254322071415`) has color intrinsics
+`fx=609.3858642578125`, `fy=609.4705200195312`,
+`cx=325.95001220703125`, `cy=247.26507568359375` at 640x480. The live server
+therefore advertises the active profile's calibration and surface-normal
+preview/recording consumers use that metadata rather than the original
+camera's matrix. The fingerprint makes camera/calibration changes explicit so
+conversion and deployment can reject an incompatible geometry contract.
 
-Compare the new intrinsics printed above before collecting or deploying a
-surface-normal policy. If they differ materially, keep the server migration
-unchanged and update the shared offline/live surface-normal calibration in a
-separate reviewed change. Do not silently retrain or deploy an old
-surface-normal checkpoint under a different camera calibration.
+`python -m teleimager.image_client --host 192.168.123.164` displays the exact
+640x480 active-camera uint8 geometry encoder outputs: fixed 0.25--1.0 m depth
+and camera-XYZ normals with the production invalid-pixel mapping. These are the
+inputs for newly collected, calibration-tagged datasets/models. The checkpoint
+processor still performs the deterministic 0.95 center crop, 256 resize, and
+`x -> 2*x/255 - 1` normalization afterward; the preview is not itself the final
+tensor. An existing untagged normals checkpoint retains its historical camera
+matrix, which a host-only live preview cannot infer or claim to reproduce.

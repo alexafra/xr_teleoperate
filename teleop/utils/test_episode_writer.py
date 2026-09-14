@@ -1,11 +1,77 @@
 """Hardware-free coverage for per-episode diagnostic metadata."""
 
+import hashlib
 import json
 import tempfile
 import unittest
 from pathlib import Path
 
 from teleop.utils.episode_writer import EpisodeWriter
+
+
+def _depth_calibration():
+    calibration = {
+        "schema": "realsense_rgbd_calibration.v1",
+        "camera": {
+            "model": "Intel RealSense D435I",
+            "serial": "254322071415",
+            "product_id": "0B3A",
+            "firmware": "5.15.1.55",
+        },
+        "color": {
+            "width": 640,
+            "height": 480,
+            "fx": 609.3858642578125,
+            "fy": 609.4705200195312,
+            "cx": 325.95001220703125,
+            "cy": 247.26507568359375,
+            "distortion": "distortion.inverse_brown_conrady",
+            "coeffs": [0.0] * 5,
+            "format": "bgr8",
+            "fps": 30,
+        },
+        "depth": {
+            "width": 640,
+            "height": 480,
+            "fx": 397.5912170410156,
+            "fy": 397.5912170410156,
+            "cx": 315.6465148925781,
+            "cy": 244.2028350830078,
+            "distortion": "distortion.brown_conrady",
+            "coeffs": [0.0] * 5,
+            "format": "z16",
+            "fps": 30,
+        },
+        "depth_to_color": {
+            "rotation": [
+                0.9999486207962036,
+                0.0033009203616529703,
+                0.009585974738001823,
+                -0.0033925294410437346,
+                0.9999485611915588,
+                0.009556086733937263,
+                -0.009553938172757626,
+                -0.009588115848600864,
+                0.9999083876609802,
+            ],
+            "translation_m": [
+                0.014800711534917355,
+                0.0008831368759274483,
+                0.0007359444862231612,
+            ],
+        },
+    }
+    canonical_json = json.dumps(
+        calibration,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    calibration["fingerprint"] = (
+        f"sha256:{hashlib.sha256(canonical_json).hexdigest()}"
+    )
+    return calibration
 
 
 class _FakeDiagnosticsSource:
@@ -23,6 +89,67 @@ class _FakeDiagnosticsSource:
 
 
 class TestEpisodeWriterDiagnostics(unittest.TestCase):
+    def test_depth_calibration_and_canonical_processing_scale_are_saved(self):
+        calibration = _depth_calibration()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            task_dir = Path(temp_dir) / "episodes"
+            writer = EpisodeWriter(
+                task_dir=str(task_dir),
+                rerun_log=False,
+                depth_scale_m_per_unit=0.0010000000474974513,
+                depth_scale_reported_m_per_unit=0.0010000000474974513,
+                depth_calibration=calibration,
+            )
+            calibration["camera"]["serial"] = "mutated"
+            self.assertTrue(writer.create_episode())
+            writer.close()
+            saved = json.loads(
+                (task_dir / "episode_0000" / "data.json").read_text()
+            )
+
+        self.assertEqual(saved["info"]["depth"]["scale_m_per_unit"], 0.001)
+        self.assertEqual(
+            saved["info"]["depth"]["scale_reported_m_per_unit"],
+            0.0010000000474974513,
+        )
+        self.assertEqual(
+            saved["info"]["depth"]["calibration"]["camera"]["serial"],
+            "254322071415",
+        )
+
+    def test_depth_scale_requires_calibration(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.assertRaisesRegex(ValueError, "depth_calibration is required"):
+                EpisodeWriter(
+                    task_dir=str(Path(temp_dir) / "episodes"),
+                    rerun_log=False,
+                    depth_scale_m_per_unit=0.001,
+                )
+
+    def test_noncanonical_depth_scale_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.assertRaisesRegex(ValueError, "canonical"):
+                EpisodeWriter(
+                    task_dir=str(Path(temp_dir) / "episodes"),
+                    rerun_log=False,
+                    depth_scale_m_per_unit=0.0005,
+                    depth_calibration=_depth_calibration(),
+                )
+
+    def test_tampered_calibration_fingerprint_is_rejected(self):
+        calibration = _depth_calibration()
+        calibration["color"]["fx"] += 1.0
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.assertRaisesRegex(ValueError, "fingerprint"):
+                EpisodeWriter(
+                    task_dir=str(Path(temp_dir) / "episodes"),
+                    rerun_log=False,
+                    depth_scale_m_per_unit=0.001,
+                    depth_calibration=calibration,
+                )
+
     def test_rgbd_pairing_provenance_is_saved_per_frame(self):
         pairing = {
             "schema_version": 1,

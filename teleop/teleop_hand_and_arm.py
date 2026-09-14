@@ -324,10 +324,30 @@ if __name__ == '__main__':
                 ] = lost_counter_tracker
 
             depth_scale = None
+            depth_scale_reported = None
+            depth_calibration = None
             if head_config.get("enable_depth", False):
-                depth_scale = head_config[
-                    "depth_scale_m_per_unit"
+                required_depth_metadata = (
+                    "depth_scale_m_per_unit",
+                    "depth_scale_reported_m_per_unit",
+                    "calibration",
+                )
+                missing_depth_metadata = [
+                    key
+                    for key in required_depth_metadata
+                    if head_config.get(key) is None
                 ]
+                if missing_depth_metadata:
+                    raise RuntimeError(
+                        "Depth recording requires calibration metadata from "
+                        "the updated live TeleImager server; missing "
+                        + ", ".join(missing_depth_metadata)
+                    )
+                depth_scale = head_config["depth_scale_m_per_unit"]
+                depth_scale_reported = head_config[
+                    "depth_scale_reported_m_per_unit"
+                ]
+                depth_calibration = head_config["calibration"]
             recorder = EpisodeWriter(task_dir = os.path.join(args.task_dir, args.task_name),
                                      task_goal = args.task_goal,
                                      task_desc = args.task_desc,
@@ -335,6 +355,8 @@ if __name__ == '__main__':
                                      frequency = args.frequency, 
                                      rerun_log = not args.headless,
                                      depth_scale_m_per_unit=depth_scale,
+                                     depth_scale_reported_m_per_unit=depth_scale_reported,
+                                     depth_calibration=depth_calibration,
                                      episode_diagnostics_sources=episode_diagnostics_sources,
                                      end_effector_info=inspire_end_effector_info,)
             if tactile_reader is not None:

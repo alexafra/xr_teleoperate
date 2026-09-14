@@ -1,5 +1,6 @@
 import os
 import cv2
+import hashlib
 import json
 import datetime
 import copy
@@ -11,8 +12,182 @@ from threading import Thread
 import logging_mp
 logger_mp = logging_mp.getLogger(__name__)
 
+CANONICAL_DEPTH_SCALE_M_PER_UNIT = 0.001
+REALSENSE_CALIBRATION_SCHEMA = "realsense_rgbd_calibration.v1"
+
+
+def _canonical_depth_scale(value, *, name):
+    try:
+        numeric = float(value)
+    except (OverflowError, TypeError, ValueError) as error:
+        raise ValueError(f"{name} must be a finite number") from error
+    if not np.isfinite(numeric):
+        raise ValueError(f"{name} must be a finite number")
+    if np.float32(numeric) != np.float32(CANONICAL_DEPTH_SCALE_M_PER_UNIT):
+        raise ValueError(
+            f"{name} must equal the canonical "
+            f"{CANONICAL_DEPTH_SCALE_M_PER_UNIT} m/unit at float32 precision; "
+            f"got {numeric!r}"
+        )
+    return CANONICAL_DEPTH_SCALE_M_PER_UNIT, numeric
+
+
+def _validated_depth_calibration(calibration):
+    if not isinstance(calibration, dict):
+        raise TypeError("depth_calibration must be a dictionary or None")
+
+    calibration = copy.deepcopy(calibration)
+    required_keys = {
+        "schema",
+        "camera",
+        "color",
+        "depth",
+        "depth_to_color",
+        "fingerprint",
+    }
+    if set(calibration) != required_keys:
+        raise ValueError(
+            "depth_calibration must contain exactly: "
+            + ", ".join(sorted(required_keys))
+        )
+    if calibration["schema"] != REALSENSE_CALIBRATION_SCHEMA:
+        raise ValueError(
+            "depth_calibration.schema must be "
+            f"{REALSENSE_CALIBRATION_SCHEMA!r}"
+        )
+    for key in ("camera", "color", "depth", "depth_to_color"):
+        if not isinstance(calibration[key], dict):
+            raise TypeError(f"depth_calibration.{key} must be a dictionary")
+
+    camera_fields = {"model", "serial", "product_id", "firmware"}
+    if set(calibration["camera"]) != camera_fields:
+        raise ValueError(
+            "depth_calibration.camera must contain exactly: "
+            + ", ".join(sorted(camera_fields))
+        )
+    for key in camera_fields:
+        value = calibration["camera"][key]
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(
+                f"depth_calibration.camera.{key} must be a non-empty string"
+            )
+
+    profile_fields = {
+        "width",
+        "height",
+        "fx",
+        "fy",
+        "cx",
+        "cy",
+        "distortion",
+        "coeffs",
+        "format",
+        "fps",
+    }
+    for profile_name in ("color", "depth"):
+        profile = calibration[profile_name]
+        if set(profile) != profile_fields:
+            raise ValueError(
+                f"depth_calibration.{profile_name} must contain exactly: "
+                + ", ".join(sorted(profile_fields))
+            )
+        for dimension in ("width", "height"):
+            value = profile[dimension]
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(
+                    f"depth_calibration.{profile_name}.{dimension} must be "
+                    "a positive integer"
+                )
+        for key in ("fx", "fy", "cx", "cy", "fps"):
+            value = profile[key]
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not np.isfinite(float(value))
+            ):
+                raise ValueError(
+                    f"depth_calibration.{profile_name}.{key} must be finite"
+                )
+        if profile["fx"] <= 0 or profile["fy"] <= 0 or profile["fps"] <= 0:
+            raise ValueError(
+                f"depth_calibration.{profile_name} focal lengths and fps "
+                "must be positive"
+            )
+        if not 0 <= profile["cx"] < profile["width"]:
+            raise ValueError(
+                f"depth_calibration.{profile_name}.cx lies outside the image"
+            )
+        if not 0 <= profile["cy"] < profile["height"]:
+            raise ValueError(
+                f"depth_calibration.{profile_name}.cy lies outside the image"
+            )
+        for key in ("distortion", "format"):
+            value = profile[key]
+            if not isinstance(value, str) or not value:
+                raise ValueError(
+                    f"depth_calibration.{profile_name}.{key} must be "
+                    "a non-empty string"
+                )
+        coeffs = profile["coeffs"]
+        if not isinstance(coeffs, list) or len(coeffs) != 5:
+            raise ValueError(
+                f"depth_calibration.{profile_name}.coeffs must contain "
+                "exactly five numbers"
+            )
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not np.isfinite(float(value))
+            for value in coeffs
+        ):
+            raise ValueError(
+                f"depth_calibration.{profile_name}.coeffs must be finite"
+            )
+
+    extrinsics = calibration["depth_to_color"]
+    if set(extrinsics) != {"rotation", "translation_m"}:
+        raise ValueError(
+            "depth_calibration.depth_to_color must contain exactly rotation "
+            "and translation_m"
+        )
+    for key, length in (("rotation", 9), ("translation_m", 3)):
+        values = extrinsics[key]
+        if not isinstance(values, list) or len(values) != length:
+            raise ValueError(
+                f"depth_calibration.depth_to_color.{key} must contain "
+                f"exactly {length} numbers"
+            )
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not np.isfinite(float(value))
+            for value in values
+        ):
+            raise ValueError(
+                f"depth_calibration.depth_to_color.{key} must be finite"
+            )
+
+    fingerprint = calibration.pop("fingerprint")
+    canonical_json = json.dumps(
+        calibration,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    expected_fingerprint = (
+        f"sha256:{hashlib.sha256(canonical_json).hexdigest()}"
+    )
+    if fingerprint != expected_fingerprint:
+        raise ValueError(
+            "depth_calibration.fingerprint does not match its canonical payload"
+        )
+    calibration["fingerprint"] = fingerprint
+    return calibration
+
+
 class EpisodeWriter():
-    def __init__(self, task_dir, task_goal=None, task_desc = None, task_steps = None, frequency=30, image_size=[640, 480], rerun_log = True, depth_scale_m_per_unit=None, episode_diagnostics_sources=None, end_effector_info=None):
+    def __init__(self, task_dir, task_goal=None, task_desc = None, task_steps = None, frequency=30, image_size=[640, 480], rerun_log = True, depth_scale_m_per_unit=None, depth_scale_reported_m_per_unit=None, depth_calibration=None, episode_diagnostics_sources=None, end_effector_info=None):
         """
         image_size: [width, height]
         """
@@ -33,18 +208,41 @@ class EpisodeWriter():
         self.frequency = frequency
         self.image_size = image_size
 
-        self.depth_scale_m_per_unit = (
-            None
-            if depth_scale_m_per_unit is None
-            else float(depth_scale_m_per_unit)
-        )
-
-        if (
-            self.depth_scale_m_per_unit is not None
-            and self.depth_scale_m_per_unit <= 0
-        ):
+        self.depth_scale_m_per_unit = None
+        self.depth_scale_reported_m_per_unit = None
+        self.depth_calibration = None
+        if depth_scale_m_per_unit is not None:
+            (
+                self.depth_scale_m_per_unit,
+                _advertised_scale,
+            ) = _canonical_depth_scale(
+                depth_scale_m_per_unit,
+                name="depth_scale_m_per_unit",
+            )
+            if depth_calibration is None:
+                raise ValueError(
+                    "depth_calibration is required when depth recording is enabled"
+                )
+            self.depth_calibration = _validated_depth_calibration(
+                depth_calibration
+            )
+        elif depth_calibration is not None:
             raise ValueError(
-                "depth_scale_m_per_unit must be positive"
+                "depth_scale_m_per_unit is required with depth_calibration"
+            )
+
+        if depth_scale_reported_m_per_unit is not None:
+            if self.depth_scale_m_per_unit is None:
+                raise ValueError(
+                    "depth_scale_m_per_unit is required with "
+                    "depth_scale_reported_m_per_unit"
+                )
+            (
+                _processing_scale,
+                self.depth_scale_reported_m_per_unit,
+            ) = _canonical_depth_scale(
+                depth_scale_reported_m_per_unit,
+                name="depth_scale_reported_m_per_unit",
             )
 
         self.rerun_log = rerun_log
@@ -128,6 +326,14 @@ class EpisodeWriter():
                 }, 
                 "sim_state": ""
             }
+        if self.depth_scale_reported_m_per_unit is not None:
+            self.info["depth"]["scale_reported_m_per_unit"] = (
+                self.depth_scale_reported_m_per_unit
+            )
+        if self.depth_calibration is not None:
+            self.info["depth"]["calibration"] = copy.deepcopy(
+                self.depth_calibration
+            )
         if self.end_effector_info is not None:
             self.info["end_effector"] = copy.deepcopy(self.end_effector_info)
             self.info["joint_names"]["left_ee"] = list(
