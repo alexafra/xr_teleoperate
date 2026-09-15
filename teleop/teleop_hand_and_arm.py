@@ -18,6 +18,10 @@ from teleop.robot_control.robot_arm import G1_29_ArmController, G1_23_ArmControl
 from teleop.robot_control.robot_arm_ik import G1_29_ArmIK, G1_23_ArmIK, H1_2_ArmIK, H1_ArmIK
 from teleimager.image_client import ImageClient
 from teleop.utils.episode_writer import EpisodeWriter
+from teleop.utils.episode_voice_feedback import (
+    AsyncEpisodeVoiceNotifier,
+    EpisodeRecordingController,
+)
 from teleop.utils.ipc import IPC_Server
 from teleop.utils.motion_switcher import MotionSwitcher, LocoClientWrapper
 from teleop.utils.rgbd_capture import (
@@ -40,7 +44,7 @@ START          = False  # Enable to start robot following VR user motion
 STOP           = False  # Enable to begin system exit procedure
 READY          = False  # Ready to (1) enter START state, (2) enter RECORD_RUNNING state
 RECORD_RUNNING = False  # True if [Recording]
-RECORD_TOGGLE  = False  # Toggle recording state
+RECORD_CONTROLLER = None
 #  -------        ---------                -----------                -----------            ---------
 #   state          [Ready]      ==>        [Recording]     ==>         [AutoSave]     -->     [Ready]
 #  -------        ---------      |         -----------      |         -----------      |     ---------
@@ -48,22 +52,34 @@ RECORD_TOGGLE  = False  # Toggle recording state
 #   READY           True         |set         False         |set         False         |auto    True
 #   RECORD_RUNNING  False        |to          True          |to          False         |        False
 #                                ∨                          ∨                          ∨
-#   RECORD_TOGGLE   False       True          False        True          False                  False
 #  -------        ---------                -----------                 -----------            ---------
-#  ==> manual: when READY is True, set RECORD_TOGGLE=True to transition.
-#  --> auto  : Auto-transition after saving data.
+#  ==> manual: an edge-triggered S press requests a transition.
+#  --> auto  : saving remains interlocked until EpisodeWriter is ready.
 
 def on_press(key):
-    global STOP, START, RECORD_TOGGLE
+    global STOP, START
     if key == 'r':
         START = True
     elif key == 'q':
         START = False
         STOP = True
-    elif key == 's' and START == True:
-        RECORD_TOGGLE = True
+    elif key == 's' and START and RECORD_CONTROLLER is not None:
+        RECORD_CONTROLLER.request_key_press()
     else:
         logger_mp.warning(f"[on_press] {key} was pressed, but no action is defined for this key.")
+
+
+def on_release(key):
+    if key == 's' and RECORD_CONTROLLER is not None:
+        RECORD_CONTROLLER.request_key_release()
+
+
+def on_ipc_press(key):
+    """IPC commands are discrete taps rather than held keyboard keys."""
+    if key == 's' and START and RECORD_CONTROLLER is not None:
+        RECORD_CONTROLLER.request_tap()
+    else:
+        on_press(key)
 
 def get_state() -> dict:
     """Return current heartbeat state"""
@@ -93,6 +109,11 @@ if __name__ == '__main__':
     parser.add_argument('--affinity', action = 'store_true', help = 'Enable high priority and set CPU affinity mode')
     # record mode and task info
     parser.add_argument('--record', action = 'store_true', help = 'Enable data recording mode')
+    parser.add_argument(
+        '--episode-voice-feedback',
+        action='store_true',
+        help='Speak successful episode start, stop, and completed-save events',
+    )
     parser.add_argument('--task-dir', type = str, default = './utils/data/', help = 'path to save data')
     parser.add_argument('--task-name', type = str, default = 'pick cube', help = 'task file name for recording')
     parser.add_argument('--task-goal', type = str, default = 'pick up cube.', help = 'task goal for recording at json file')
@@ -102,8 +123,12 @@ if __name__ == '__main__':
     args = parser.parse_args()
     if args.ee in ("inspire_dfx", "inspire_ftp") and args.input_mode != "hand":
         parser.error(f"--ee {args.ee} requires --input-mode hand")
+    if args.episode_voice_feedback and not args.record:
+        parser.error("--episode-voice-feedback requires --record")
     logger_mp.info(f"args: {args}")
     tactile_reader = None
+    voice_notifier = None
+    recording_controller = None
 
     try:
         # setup dds communication domains id
@@ -114,13 +139,20 @@ if __name__ == '__main__':
 
         # ipc communication mode. client usage: see utils/ipc.py
         if args.ipc:
-            ipc_server = IPC_Server(on_press=on_press,get_state=get_state)
+            ipc_server = IPC_Server(on_press=on_ipc_press,get_state=get_state)
             ipc_server.start()
         # sshkeyboard communication mode
         else:
-            listen_keyboard_thread = threading.Thread(target=listen_keyboard, 
-                                                      kwargs={"on_press": on_press, "until": None, "sequential": False,}, 
-                                                      daemon=True)
+            listen_keyboard_thread = threading.Thread(
+                target=listen_keyboard,
+                kwargs={
+                    "on_press": on_press,
+                    "on_release": on_release,
+                    "until": None,
+                    "sequential": True,
+                },
+                daemon=True,
+            )
             listen_keyboard_thread.start()
 
         # image client
@@ -364,6 +396,13 @@ if __name__ == '__main__':
                 recorder.info["tactile_names"]["right_ee"] = list(TACTILE_PADS)
             if rgbd_capture is not None:
                 recorder.info["rgbd_pairing"] = rgbd_capture.episode_metadata()
+            if args.episode_voice_feedback:
+                voice_notifier = AsyncEpisodeVoiceNotifier()
+            recording_controller = EpisodeRecordingController(
+                recorder,
+                notifier=voice_notifier,
+            )
+            RECORD_CONTROLLER = recording_controller
 
         logger_mp.info("----------------------------------------------------------------")
         logger_mp.info("🟢  Press [r] to start syncing the robot with your movements.")
@@ -430,21 +469,19 @@ if __name__ == '__main__':
                 if args.record:
                     right_wrist_img = img_client.get_right_wrist_frame()
 
-            # record mode
-            if args.record and RECORD_TOGGLE:
-                RECORD_TOGGLE = False
-                if not RECORD_RUNNING:
-                    if recorder.create_episode():
-                        RECORD_RUNNING = True
-                    else:
-                        logger_mp.error("Failed to create episode. Recording not started.")
-                else:
-                    RECORD_RUNNING = False
+            # Record transitions are edge-triggered and remain interlocked
+            # while EpisodeWriter finishes an asynchronous save.
+            if args.record:
+                record_event = recording_controller.update()
+                RECORD_RUNNING = recording_controller.recording
+                READY = recording_controller.ready_to_start
+                if record_event == "start_failed":
+                    logger_mp.error("Failed to create episode. Recording not started.")
+                elif record_event == "stopping":
                     logger_mp.info(
                         f"Capture stopped. Pending frames: "
                         f"{recorder.item_data_queue.qsize()}"
                     )
-                    recorder.save_episode()
                     if args.sim:
                         publish_reset_category(1, reset_pose_publisher)
 
@@ -504,7 +541,7 @@ if __name__ == '__main__':
 
             # record data
             if args.record:
-                READY = recorder.is_ready() # now ready to (2) enter RECORD_RUNNING state
+                READY = recording_controller.ready_to_start
                 # dex hand or gripper
                 if args.ee == "dex3" and args.input_mode == "hand":
                     with dual_hand_data_lock:
@@ -687,9 +724,15 @@ if __name__ == '__main__':
         logger_mp.error(traceback.format_exc())
     finally:
         try:
-            if args.record and not recorder.is_ready():
+            if args.record and recording_controller is not None:
                 # Freeze episode timing and subscriber diagnostics before any
-                # shutdown homing or queue-drain delay.
+                # shutdown homing or queue-drain delay. The controller avoids
+                # duplicating a save that is already pending.
+                recording_controller.stop_for_shutdown()
+                RECORD_RUNNING = recording_controller.recording
+            elif args.record and not recorder.is_ready():
+                # Retain the legacy fallback if initialization failed between
+                # constructing EpisodeWriter and its recording controller.
                 recorder.save_episode()
         except Exception as e:
             logger_mp.error(f"Failed to stop active recording: {e}")
@@ -735,8 +778,17 @@ if __name__ == '__main__':
         try:
             if args.record:
                 recorder.close()
+                if recording_controller is not None:
+                    recording_controller.poll_save_completion()
         except Exception as e:
             logger_mp.error(f"Failed to close recorder: {e}")
+
+        try:
+            RECORD_CONTROLLER = None
+            if voice_notifier is not None:
+                voice_notifier.close()
+        except Exception as e:
+            logger_mp.error(f"Failed to close episode voice feedback: {e}")
 
         try:
             if tactile_reader is not None:
