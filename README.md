@@ -220,8 +220,11 @@ build  cert.pem  key.pem  LICENSE  pyproject.toml  README.md  rootCA.key  rootCA
 |        `--ee`         | Select the end-effector type of the arm (see 0. 📖 Introduction) |     `dex1` `dex3` `inspire_ftp` `inspire_dfx` `brainco`      |       None        |
 |   `--img-server-ip`   | Set the image server IP address for receiving image streams and configuring WebRTC signaling |                        `IPv4` address                        | `192.168.123.164` |
 | `--network-interface` |    Set the network interface for CycloneDDS communication    |                    Network Interface Name                    |      `None`       |
-|      `--xr-view`      | Select a headset view; repeat the flag for a left-to-right split in flag order | `rgb` `depth` `normals` | `rgb` |
-| `--xr-preview-fps` | Cap local RGB/depth/normals preview work outside the control loop | Float greater than 0 and at most 30 | `15.0` |
+|      `--xr-view`      | Select a headset view; repeat the flag for a left-to-right split in flag order | `rgb` `depth` `normals` `depth-overlay` `depth-edges` `depth-contours` `depth-wireframe` `near-warning` `normal-overlay` `normal-relight` | `rgb` |
+| `--xr-preview-fps` | Cap local RGB/geometry preview work outside the control loop | Float greater than 0 and at most 30 | `30.0` |
+| `--xr-fusion-opacity` | Set the geometry contribution for all fused views; 0 preserves RGB and 1 applies the full effect | Finite float from 0 to 1 | `0.5` |
+| `--xr-near-warning-m` | Set the far boundary of the `near-warning` tint; closer valid depth progresses from amber to red | Finite metres greater than 0.25 and at most 1.0 | `0.45` |
+| `--xr-depth-contour-spacing-m` | Set the equal optical-depth spacing for `depth-contours` | Finite metres from 0.001 to 0.75 | `0.05` |
 
 - **Mode switch parameters**
 
@@ -233,7 +236,9 @@ build  cert.pem  key.pem  LICENSE  pyproject.toml  README.md  rootCA.key  rootCA
 |   `--ipc`    | **Inter-process communication mode** Allows controlling the xr_teleoperate program’s state via IPC. Suitable for interaction with agent programs. |
 | `--affinity` | **CPU affinity mode** Set CPU core affinity. If you are unsure what this is, do not set it. |
 |  `--record`  | **Enable data recording mode** Press **r** to start teleoperation, then **s** to start recording; press **s** again to stop and save the episode. Press **s** repeatedly to repeat the process. |
-| `--episode-voice-feedback` | **Opt-in episode announcements** With `--record`, speak “Starting recording” after an episode is created, “Stopping recording” when its save is requested, and “Recording saved” only after the asynchronous writer completes. Speech is queued outside the control loop. The bundled neural WAV prompts play through PipeWire with `pw-play`; `spd-say` is retained as a fallback if those assets or the player are unavailable. |
+| `--xr-view-only` (`--xr-camera-only`) | **Camera/headset-only safety mode.** Starts the TeleImager client and TeleVuer headset view, but does not initialize DDS, motion control, simulation, arm control, or hand control. `--record` is rejected. Press **q** or Ctrl-C to exit. |
+| `--xr-stereo` (`--xr-dichoptic`) | With `--xr-view-only`, route the first of exactly two ordered `--xr-view` modalities to the left eye and the second to the right eye. |
+| `--episode-voice-feedback` | **Opt-in episode announcements** With `--record`, speak “Starting recording” after an episode is created, “Stopping recording” when its save is requested, and “Recording saved” only after the asynchronous writer completes. Every tenth finalized episode in the current task directory also speaks the total (for example, “10 episodes saved”). Speech is queued outside the control loop. The bundled neural WAV prompts play through PipeWire with `pw-play`; dynamic totals and fallback speech use `spd-say`. |
 |  `--task-*`  | Configure the save path, target, description, and steps of the recorded task. |
 
 ### Headset RGB and geometry views
@@ -243,6 +248,49 @@ geometry view, or repeat `--xr-view` to split the existing TeleVuer image
 buffer left-to-right:
 
 ```bash
+# Camera/headset only: no DDS and no robot controllers
+python teleop_hand_and_arm.py --xr-view-only \
+  --img-server-ip 192.168.123.164 --xr-view rgb
+
+# Dichoptic fusion test: RGB left eye, masked normals right eye
+python teleop_hand_and_arm.py --xr-view-only --xr-stereo \
+  --img-server-ip 192.168.123.164 \
+  --xr-view rgb --xr-view normals --xr-preview-fps 30
+
+# Perceptual depth colour blended only where depth is valid
+python teleop_hand_and_arm.py --xr-view-only \
+  --img-server-ip 192.168.123.164 \
+  --xr-view depth-overlay --xr-fusion-opacity 0.5
+
+# Cyan geometry contours over the unchanged camera image
+python teleop_hand_and_arm.py --xr-view-only \
+  --img-server-ip 192.168.123.164 --xr-view depth-edges
+
+# Equal 5 cm optical-depth isolines over otherwise unchanged RGB
+python teleop_hand_and_arm.py --xr-view-only \
+  --img-server-ip 192.168.123.164 \
+  --xr-view depth-contours --xr-depth-contour-spacing-m 0.05
+
+# Sparse depth-coloured screen-space triangular grid over RGB
+python teleop_hand_and_arm.py --xr-view-only \
+  --img-server-ip 192.168.123.164 --xr-view depth-wireframe
+
+# Amber-to-red near-object tint over RGB (red at 0.25 m)
+python teleop_hand_and_arm.py --xr-view-only \
+  --img-server-ip 192.168.123.164 \
+  --xr-view near-warning --xr-near-warning-m 0.45 \
+  --xr-fusion-opacity 0.5
+
+# Literal canonical normal-map colours blended over valid RGB pixels
+python teleop_hand_and_arm.py --xr-view-only \
+  --img-server-ip 192.168.123.164 \
+  --xr-view normal-overlay --xr-fusion-opacity 0.5
+
+# Neutral headlamp shading driven by v2 normals (RGB chroma is retained)
+python teleop_hand_and_arm.py --xr-view-only \
+  --img-server-ip 192.168.123.164 \
+  --xr-view normal-relight --xr-fusion-opacity 0.6
+
 # Surface normals only
 python teleop_hand_and_arm.py --ee=inspire_ftp --motion --xr-view normals
 
@@ -255,16 +303,68 @@ python teleop_hand_and_arm.py --ee=inspire_ftp --motion \
   --xr-view depth --xr-view normals --xr-preview-fps 10
 ```
 
+`--xr-stereo` is a dichoptic fusion experiment rather than synthetic 3-D
+parallax: the first modality fills the left eye and the second fills the right
+eye. For example, use `--xr-view rgb --xr-view normals` or replace `normals`
+with `depth`. Both images come from the same monocular aligned RGB-D source and
+are placed in TeleVuer's existing side-by-side binocular layout. Open the usual
+TeleVuer URL on the headset (for the standard host,
+`https://192.168.123.2:8012/?ws=wss://192.168.123.2:8012`).
+Robot-related flags such as `--motion`, `--sim`, `--ee`, and
+`--network-interface` are ignored in this mode, so adding
+`--xr-view-only` to a familiar command cannot acquire robot command
+authority. Recording is rejected rather than silently producing incomplete
+data. This does not synthesize parallax or claim to be a two-camera stereo
+capture.
+
 Depth and normals are generated from the aligned-depth stream. Normals use the
 same calibrated-intrinsics, masked surface-normal v2 encoder and inclusive
-0.25–1.0 m validity range as current data processing. Geometry selection
+0.25–1.0 m validity range as current data processing. The additional fused
+views are intended for short headset comparisons:
+
+- `depth-overlay` alpha-blends a perceptually uniform Viridis depth map into
+  RGB only at in-range valid pixels; missing or out-of-range depth leaves RGB
+  byte-for-byte unchanged.
+- `depth-edges` adds cyan contours only where a complete valid-depth
+  neighbourhood supports an edge, so depth holes are not painted as objects.
+- `depth-contours` adds cyan equal optical-depth isolines at
+  `--xr-depth-contour-spacing-m`; a small spatial smoothing/support check
+  suppresses depth speckle, and missing/out-of-range samples or jumps over
+  5 cm break the lines rather than becoming false contours.
+- `depth-wireframe` draws a sparse screen-space triangular grid, coloured with
+  four ordered Viridis distance bands. Missing/out-of-range samples and local
+  depth jumps over 5 cm break the grid.
+- `near-warning` leaves RGB unchanged beyond `--xr-near-warning-m` and at
+  missing or out-of-range depth. Within the valid warning band, it progresses
+  from amber at the configured boundary to red at the 0.25 m near bound.
+- `normal-overlay` alpha-blends the canonical normal-map colours over RGB only
+  at pixels where the v2 normal is valid; invalid pixels retain exact RGB.
+- `normal-relight` uses the v2 normal-valid mask and a neutral camera headlamp
+  to modify RGB luminance while retaining its chroma and texture.
+
+`--xr-fusion-opacity` consistently controls all seven effects. A value of 0
+is an exact RGB baseline; 1 applies the complete overlay or relighting effect.
+Each fused token can also be used as a panel in a repeated `--xr-view` command
+or as either eye in `--xr-stereo`.
+
+`near-warning` is only a headset cue from head-camera optical-axis depth; it
+does not measure robot or end-effector clearance and is not collision
+prediction. Untinted RGB does not mean an area is safe: depth holes,
+out-of-range pixels, and a held last frame after a preview failure can all show
+without a warning tint.
+
+Geometry selection
 requires the aligned-depth ZMQ stream and a valid live calibration contract
 (or the exact pinned Inspire D435I fallback); it fails at startup otherwise.
-Because camera WebRTC carries RGB directly, selecting depth or normals routes
-the headset through the local ZMQ/TeleVuer buffer. Preview fetch, conversion,
-split composition, and rendering run in a capped latest-only worker; slow
-preview work drops intermediate display frames and does not change raw episode
-recording.
+Because camera WebRTC carries RGB directly, selecting any geometry or fusion
+view routes the headset through the local ZMQ/TeleVuer buffer. Fusion currently
+reads spatially aligned RGB and depth from separate latest-frame slots; those
+slots are not capture-synchronized, so motion can reveal temporal seams.
+`depth-wireframe` is a fixed-camera, screen-space sampling aid rather than a
+world-anchored reconstructed mesh, so it does not create motion parallax.
+Preview fetch, conversion, split composition, and rendering run in a capped
+latest-only worker; slow preview work drops intermediate display frames and
+does not change raw episode recording.
 
 ### Episode timing and DDS quality report
 
