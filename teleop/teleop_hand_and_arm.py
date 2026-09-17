@@ -17,6 +17,7 @@ from televuer import TeleVuerWrapper
 from teleop.robot_control.robot_arm import G1_29_ArmController, G1_23_ArmController, H1_2_ArmController, H1_ArmController
 from teleop.robot_control.robot_arm_ik import G1_29_ArmIK, G1_23_ArmIK, H1_2_ArmIK, H1_ArmIK
 from teleimager.image_client import ImageClient
+from teleimager.geometry_preview import legacy_depth_metadata_from_head_config
 from teleop.utils.episode_writer import EpisodeWriter
 from teleop.utils.episode_voice_feedback import (
     AsyncEpisodeVoiceNotifier,
@@ -129,6 +130,7 @@ if __name__ == '__main__':
     tactile_reader = None
     voice_notifier = None
     recording_controller = None
+    recorder = None
 
     try:
         # setup dds communication domains id
@@ -370,16 +372,33 @@ if __name__ == '__main__':
                     if head_config.get(key) is None
                 ]
                 if missing_depth_metadata:
-                    raise RuntimeError(
-                        "Depth recording requires calibration metadata from "
-                        "the updated live TeleImager server; missing "
-                        + ", ".join(missing_depth_metadata)
+                    try:
+                        legacy_metadata = legacy_depth_metadata_from_head_config(
+                            head_config
+                        )
+                    except ValueError as error:
+                        raise RuntimeError(
+                            "Depth recording requires calibration metadata from "
+                            "the updated live TeleImager server; missing "
+                            + ", ".join(missing_depth_metadata)
+                        ) from error
+                    logger_mp.warning(
+                        "Camera server omitted calibration metadata; recording "
+                        "with the exact pinned calibration for D435I serial "
+                        "254322071415. This startup-only metadata fallback does "
+                        "not change frame capture or control-loop processing."
                     )
-                depth_scale = head_config["depth_scale_m_per_unit"]
-                depth_scale_reported = head_config[
-                    "depth_scale_reported_m_per_unit"
-                ]
-                depth_calibration = head_config["calibration"]
+                    depth_scale = legacy_metadata["depth_scale_m_per_unit"]
+                    depth_scale_reported = legacy_metadata[
+                        "depth_scale_reported_m_per_unit"
+                    ]
+                    depth_calibration = legacy_metadata["calibration"]
+                else:
+                    depth_scale = head_config["depth_scale_m_per_unit"]
+                    depth_scale_reported = head_config[
+                        "depth_scale_reported_m_per_unit"
+                    ]
+                    depth_calibration = head_config["calibration"]
             recorder = EpisodeWriter(task_dir = os.path.join(args.task_dir, args.task_name),
                                      task_goal = args.task_goal,
                                      task_desc = args.task_desc,
@@ -730,7 +749,7 @@ if __name__ == '__main__':
                 # duplicating a save that is already pending.
                 recording_controller.stop_for_shutdown()
                 RECORD_RUNNING = recording_controller.recording
-            elif args.record and not recorder.is_ready():
+            elif args.record and recorder is not None and not recorder.is_ready():
                 # Retain the legacy fallback if initialization failed between
                 # constructing EpisodeWriter and its recording controller.
                 recorder.save_episode()
@@ -776,7 +795,7 @@ if __name__ == '__main__':
             logger_mp.error(f"Failed to stop sim state subscriber: {e}")
         
         try:
-            if args.record:
+            if args.record and recorder is not None:
                 recorder.close()
                 if recording_controller is not None:
                     recording_controller.poll_save_completion()
