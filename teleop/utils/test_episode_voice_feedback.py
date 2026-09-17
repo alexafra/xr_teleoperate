@@ -1,11 +1,12 @@
 from tempfile import TemporaryDirectory
 import threading
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from teleop.utils.episode_voice_feedback import (
     _DEFAULT_PROMPT_DIR,
     _PROMPT_FILENAMES,
+    EPISODE_COUNT_ANNOUNCEMENT_INTERVAL,
     RECORDING_SAVED,
     STARTING_RECORDING,
     STOPPING_RECORDING,
@@ -26,11 +27,12 @@ class _Clock:
 
 
 class _Recorder:
-    def __init__(self, *, create_result=True):
+    def __init__(self, *, create_result=True, successful_episode_count=0):
         self.create_result = create_result
         self.ready = True
         self.create_calls = 0
         self.save_calls = 0
+        self.successful_episode_count = successful_episode_count
 
     def create_episode(self):
         self.create_calls += 1
@@ -45,15 +47,22 @@ class _Recorder:
         return self.ready
 
     def complete_save(self):
+        if not self.ready:
+            self.successful_episode_count += 1
         self.ready = True
+
+    def get_successful_episode_count(self):
+        return self.successful_episode_count
 
 
 class _Notifier:
     def __init__(self, *, raise_on_notify=False):
         self.messages = []
+        self.attempted_messages = []
         self.raise_on_notify = raise_on_notify
 
     def notify(self, message):
+        self.attempted_messages.append(message)
         if self.raise_on_notify:
             raise RuntimeError("speaker unavailable")
         self.messages.append(message)
@@ -61,9 +70,18 @@ class _Notifier:
 
 
 class TestEpisodeRecordingController(unittest.TestCase):
-    def make_controller(self, *, create_result=True, notifier=None):
+    def make_controller(
+        self,
+        *,
+        create_result=True,
+        notifier=None,
+        successful_episode_count=0,
+    ):
         clock = _Clock()
-        recorder = _Recorder(create_result=create_result)
+        recorder = _Recorder(
+            create_result=create_result,
+            successful_episode_count=successful_episode_count,
+        )
         notifier = notifier or _Notifier()
         controller = EpisodeRecordingController(
             recorder,
@@ -169,6 +187,76 @@ class TestEpisodeRecordingController(unittest.TestCase):
         self.assertTrue(controller.poll_save_completion())
         self.assertFalse(controller.poll_save_completion())
         self.assertEqual(notifier.messages.count(RECORDING_SAVED), 1)
+
+    def test_tenth_completed_save_announces_total_once_after_completion(self):
+        controller, recorder, notifier, clock = self.make_controller(
+            successful_episode_count=9
+        )
+        self.start_recording(controller)
+        self.release_and_rearm(controller, clock)
+        self.assertTrue(controller.request_key_press())
+        self.assertEqual(controller.update(), "stopping")
+
+        self.assertFalse(controller.poll_save_completion())
+        self.assertNotIn("10 episodes saved", notifier.messages)
+
+        recorder.complete_save()
+        self.assertTrue(controller.poll_save_completion())
+        self.assertFalse(controller.poll_save_completion())
+        self.assertEqual(
+            notifier.messages[-2:],
+            [RECORDING_SAVED, "10 episodes saved"],
+        )
+        self.assertEqual(notifier.messages.count("10 episodes saved"), 1)
+
+    def test_existing_tenth_save_is_not_reannounced_at_eleven(self):
+        controller, recorder, notifier, clock = self.make_controller(
+            successful_episode_count=EPISODE_COUNT_ANNOUNCEMENT_INTERVAL
+        )
+        self.start_recording(controller)
+        self.release_and_rearm(controller, clock)
+        self.assertTrue(controller.request_key_press())
+        self.assertEqual(controller.update(), "stopping")
+        recorder.complete_save()
+
+        self.assertTrue(controller.poll_save_completion())
+        self.assertEqual(notifier.messages[-1], RECORDING_SAVED)
+        self.assertNotIn("10 episodes saved", notifier.messages)
+
+    def test_count_announcement_is_skipped_when_saved_voice_notify_fails(self):
+        notifier = _Notifier(raise_on_notify=True)
+        controller, recorder, _notifier, clock = self.make_controller(
+            notifier=notifier,
+            successful_episode_count=9,
+        )
+        self.start_recording(controller)
+        self.release_and_rearm(controller, clock)
+        self.assertTrue(controller.request_key_press())
+        self.assertEqual(controller.update(), "stopping")
+        recorder.complete_save()
+
+        self.assertTrue(controller.poll_save_completion())
+        self.assertIn(RECORDING_SAVED, notifier.attempted_messages)
+        self.assertNotIn("10 episodes saved", notifier.attempted_messages)
+
+    def test_tenth_save_completes_normally_when_voice_is_disabled(self):
+        clock = _Clock()
+        recorder = _Recorder(successful_episode_count=9)
+        controller = EpisodeRecordingController(
+            recorder,
+            notifier=None,
+            debounce_s=0.5,
+            clock=clock,
+        )
+        self.start_recording(controller)
+        self.release_and_rearm(controller, clock)
+        self.assertTrue(controller.request_key_press())
+        self.assertEqual(controller.update(), "stopping")
+        recorder.complete_save()
+
+        self.assertTrue(controller.poll_save_completion())
+        self.assertEqual(recorder.get_successful_episode_count(), 10)
+        self.assertFalse(controller.poll_save_completion())
 
     def test_held_s_across_save_completion_requires_release_and_debounce(self):
         controller, recorder, notifier, clock = self.make_controller()
@@ -310,6 +398,21 @@ class TestAsyncEpisodeVoiceNotifier(unittest.TestCase):
             ["/usr/bin/spd-say", "--wait", STARTING_RECORDING],
             "spd-say",
         )
+
+    def test_dynamic_count_without_tts_is_skipped_without_disabling_fixed_prompts(self):
+        with patch(
+            "teleop.utils.episode_voice_feedback.shutil.which",
+            return_value=None,
+        ):
+            notifier = AsyncEpisodeVoiceNotifier(
+                audio_player="/usr/bin/pw-play",
+            )
+        try:
+            self.assertTrue(notifier.available)
+            self.assertFalse(notifier.notify("10 episodes saved"))
+            self.assertTrue(notifier.available)
+        finally:
+            notifier.close()
 
     def test_speaker_runs_only_on_background_worker(self):
         spoken = []

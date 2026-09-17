@@ -89,6 +89,36 @@ class _FakeDiagnosticsSource:
 
 
 class TestEpisodeWriterDiagnostics(unittest.TestCase):
+    def test_successful_episode_count_ignores_partial_directories_and_resumes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            task_dir = Path(temp_dir) / "episodes"
+            writer = EpisodeWriter(task_dir=str(task_dir), rerun_log=False)
+            self.assertEqual(writer.get_successful_episode_count(), 0)
+            self.assertTrue(writer.create_episode())
+            self.assertEqual(writer.get_successful_episode_count(), 0)
+            writer.close()
+            self.assertEqual(writer.get_successful_episode_count(), 1)
+
+            partial_dir = task_dir / "episode_9999"
+            partial_dir.mkdir()
+            (partial_dir / "data.json").write_text(
+                '{\n"data": [\n{"idx": 0}',
+                encoding="utf-8",
+            )
+
+            truncated_footer_dir = task_dir / "episode_9998"
+            truncated_footer_dir.mkdir()
+            (truncated_footer_dir / "data.json").write_text(
+                '{\n"data": [],\n"timing": {"frame_count": 1',
+                encoding="utf-8",
+            )
+
+            resumed = EpisodeWriter(task_dir=str(task_dir), rerun_log=False)
+            try:
+                self.assertEqual(resumed.get_successful_episode_count(), 1)
+            finally:
+                resumed.close()
+
     def test_depth_calibration_and_canonical_processing_scale_are_saved(self):
         calibration = _depth_calibration()
 

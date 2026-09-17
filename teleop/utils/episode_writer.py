@@ -14,6 +14,91 @@ logger_mp = logging_mp.getLogger(__name__)
 
 CANONICAL_DEPTH_SCALE_M_PER_UNIT = 0.001
 REALSENSE_CALIBRATION_SCHEMA = "realsense_rgbd_calibration.v1"
+# The timing object is appended only by _save_episode after the frame queue has
+# drained. Match the key rather than its indentation so previously reformatted
+# but valid episode JSON remains part of the task-directory total.
+_COMPLETED_EPISODE_MARKER = b'"timing":'
+_EPISODE_SCAN_CHUNK_BYTES = 64 * 1024
+_MAX_EPISODE_FOOTER_BYTES = 1024 * 1024
+
+
+def _is_complete_episode_footer(footer_bytes):
+    """Validate the self-contained tail beginning at the top-level timing key."""
+
+    try:
+        footer = json.loads(b"{" + footer_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+
+    if not isinstance(footer, dict):
+        return False
+    if set(footer) not in ({"timing"}, {"timing", "diagnostics"}):
+        return False
+    return isinstance(footer["timing"], dict)
+
+
+def _episode_file_has_completed_save(json_path):
+    """Recognize a complete footer written by the asynchronous save path."""
+
+    try:
+        with open(json_path, "rb") as episode_file:
+            episode_file.seek(0, os.SEEK_END)
+            position = episode_file.tell()
+            suffix = b""
+            while position > 0 and len(suffix) < _MAX_EPISODE_FOOTER_BYTES:
+                read_size = min(
+                    _EPISODE_SCAN_CHUNK_BYTES,
+                    position,
+                    _MAX_EPISODE_FOOTER_BYTES - len(suffix),
+                )
+                position -= read_size
+                episode_file.seek(position)
+                chunk = episode_file.read(read_size)
+                tail = chunk + suffix
+
+                # Candidates entirely in the existing suffix were already
+                # checked. Include just enough suffix bytes to catch a marker
+                # split across this chunk boundary.
+                search_end = min(
+                    len(tail),
+                    len(chunk) + len(_COMPLETED_EPISODE_MARKER) - 1,
+                )
+                while search_end:
+                    marker_offset = tail.rfind(
+                        _COMPLETED_EPISODE_MARKER,
+                        0,
+                        search_end,
+                    )
+                    if marker_offset < 0:
+                        break
+                    if _is_complete_episode_footer(tail[marker_offset:]):
+                        return True
+                    search_end = marker_offset
+                suffix = tail
+    except OSError:
+        return False
+    return False
+
+
+def _count_completed_episodes(task_dir):
+    """Count finalized episode JSON files without loading their frame metadata."""
+
+    try:
+        names = os.listdir(task_dir)
+    except OSError:
+        return 0
+
+    completed = 0
+    for name in names:
+        prefix, separator, suffix = name.partition("_")
+        if prefix != "episode" or separator != "_" or not suffix.isdigit():
+            continue
+        episode_dir = os.path.join(task_dir, name)
+        if not os.path.isdir(episode_dir):
+            continue
+        if _episode_file_has_completed_save(os.path.join(episode_dir, "data.json")):
+            completed += 1
+    return completed
 
 
 def _canonical_depth_scale(value, *, name):
@@ -267,6 +352,11 @@ class EpisodeWriter():
         else:
             os.makedirs(self.task_dir)
             logger_mp.info(f"==> episode directory does not exist, now create one.\n")
+        self.successful_episode_count = _count_completed_episodes(self.task_dir)
+        logger_mp.info(
+            "==> Successfully finalized episodes already in task_dir: "
+            f"{self.successful_episode_count}\n"
+        )
         self.data_info()
 
         self.is_available = True  # Indicates whether the class is available for new operations
@@ -293,6 +383,11 @@ class EpisodeWriter():
     
     def is_ready(self):
         return self.is_available
+
+    def get_successful_episode_count(self):
+        """Return finalized episodes present at startup plus this session's saves."""
+
+        return self.successful_episode_count
 
     def data_info(self, version='1.0.0', date=None, author=None):
         self.info = {
@@ -661,6 +756,7 @@ class EpisodeWriter():
                 )
             f.write("\n}")
         #timing end
+        self.successful_episode_count += 1
         self.need_save = False     # Reset the save flag
         self.is_available = True   # Mark the class as available after saving
         logger_mp.info("==> Episode saved successfully to "

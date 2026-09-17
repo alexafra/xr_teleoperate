@@ -13,6 +13,7 @@ logger_mp = logging_mp.getLogger(__name__)
 STARTING_RECORDING = "Starting recording"
 STOPPING_RECORDING = "Stopping recording"
 RECORDING_SAVED = "Recording saved"
+EPISODE_COUNT_ANNOUNCEMENT_INTERVAL = 10
 
 _PROMPT_FILENAMES = {
     STARTING_RECORDING: "starting_recording.wav",
@@ -99,11 +100,21 @@ class AsyncEpisodeVoiceNotifier:
 
     def notify(self, message):
         """Queue a phrase without waiting for speech or queue capacity."""
+        message = str(message)
         with self._state_lock:
             if self._closed or self._failed:
                 return False
+            # Bundled WAVs cover the fixed prompts. Dynamic count phrases need
+            # a text-to-speech executable; reject them without disabling the
+            # fixed voice feedback when only natural prompt playback exists.
+            if (
+                self._speaker is None
+                and message not in _PROMPT_FILENAMES
+                and self._executable is None
+            ):
+                return False
             try:
-                self._queue.put_nowait(str(message))
+                self._queue.put_nowait(message)
             except Full:
                 # This can be reached from the 30 Hz loop. Accounting is kept
                 # in-memory and reported during close; never log or block here.
@@ -147,6 +158,9 @@ class AsyncEpisodeVoiceNotifier:
                 "natural voice playback",
             )
             return
+
+        if self._executable is None:
+            raise RuntimeError("dynamic episode voice feedback requires spd-say")
 
         self._run_speech_process(
             [self._executable, "--wait", message],
@@ -234,6 +248,26 @@ class EpisodeRecordingController:
         self._toggle_requested = False
         self._key_down = False
         self._accept_after = 0.0
+        initial_save_count = self._read_successful_save_count()
+        self._successful_save_count = (
+            0 if initial_save_count is None else initial_save_count
+        )
+        self._last_announced_save_count = (
+            self._successful_save_count
+            - self._successful_save_count % EPISODE_COUNT_ANNOUNCEMENT_INTERVAL
+        )
+
+    def _read_successful_save_count(self):
+        getter = getattr(self._recorder, "get_successful_episode_count", None)
+        if not callable(getter):
+            return None
+        try:
+            count = getter()
+        except Exception:
+            return None
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            return None
+        return count
 
     @property
     def recording(self):
@@ -314,11 +348,29 @@ class EpisodeRecordingController:
         if not self._recorder.is_ready():
             return False
 
+        recorder_count = self._read_successful_save_count()
         with self._lock:
             if not self._save_pending:
                 return False
             self._save_pending = False
-        self._notify(RECORDING_SAVED)
+            if (
+                recorder_count is None
+                or recorder_count <= self._successful_save_count
+            ):
+                self._successful_save_count += 1
+            else:
+                self._successful_save_count = recorder_count
+            completed_count = self._successful_save_count
+            count_milestone = (
+                completed_count % EPISODE_COUNT_ANNOUNCEMENT_INTERVAL == 0
+                and completed_count > self._last_announced_save_count
+            )
+            if count_milestone:
+                self._last_announced_save_count = completed_count
+
+        saved_queued = self._notify(RECORDING_SAVED)
+        if count_milestone and saved_queued:
+            self._notify(f"{completed_count} episodes saved")
         return True
 
     def stop_for_shutdown(self):
