@@ -31,12 +31,21 @@ from teleop.utils.rgbd_capture import (
     should_prefer_atomic_rgbd_recording,
 )
 from teleop.utils.xr_geometry_preview import (
+    DEFAULT_XR_DEPTH_CONTOUR_SPACING_M,
+    DEFAULT_XR_FUSION_OPACITY,
+    DEFAULT_XR_NEAR_WARNING_M,
     DEFAULT_XR_PREVIEW_FPS,
     XR_VIEW_CHOICES,
     XrPreviewWorker,
     normalize_xr_views,
     validate_geometry_preview_contract,
+    validate_xr_depth_contour_spacing_m,
+    validate_xr_fusion_opacity,
+    validate_xr_near_warning_m,
     validate_xr_preview_fps,
+    xr_views_need_color,
+    xr_views_need_geometry,
+    xr_views_use_fusion,
 )
 from sshkeyboard import listen_keyboard, stop_listening
 
@@ -90,6 +99,17 @@ def on_ipc_press(key):
     else:
         on_press(key)
 
+
+def on_xr_camera_only_press(key):
+    """Allow a view-only headset session to stop without arming the robot."""
+    global STOP
+    if key == 'q':
+        STOP = True
+    else:
+        logger_mp.warning(
+            f"[xr-camera-only] {key} was pressed; only [q] is active."
+        )
+
 def get_state() -> dict:
     """Return current heartbeat state"""
     global START, STOP, RECORD_RUNNING, READY
@@ -99,6 +119,221 @@ def get_state() -> dict:
         "READY": READY,
         "RECORD_RUNNING": RECORD_RUNNING,
     }
+
+
+def run_xr_camera_only(
+    args,
+    *,
+    image_client_factory=ImageClient,
+    televuer_wrapper_factory=TeleVuerWrapper,
+    preview_worker_factory=XrPreviewWorker,
+    keyboard_listener=listen_keyboard,
+    keyboard_stopper=stop_listening,
+    sleep=time.sleep,
+):
+    """Run only the camera-to-headset path, without DDS or robot controllers.
+
+    This deliberately lives in a self-contained early-exit path.  In
+    particular, it must never call ``ChannelFactoryInitialize`` or construct
+    an arm, hand, motion, recording, or simulation controller.
+    """
+    global START, STOP, READY
+
+    START = False
+    STOP = False
+    READY = False
+    img_client = None
+    tv_wrapper = None
+    xr_preview_worker = None
+    keyboard_thread = None
+
+    try:
+        geometry_view_requested = xr_views_need_geometry(args.xr_view)
+        color_view_requested = xr_views_need_color(args.xr_view)
+        fusion_view_requested = xr_views_use_fusion(args.xr_view)
+        dichoptic_stereo = bool(getattr(args, "xr_stereo", False))
+        img_client = image_client_factory(
+            host=args.img_server_ip,
+            request_bgr=True,
+            eager_head_color=color_view_requested,
+            eager_aligned_depth=geometry_view_requested,
+            eager_raw_depth=False,
+        )
+        camera_config = img_client.get_cam_config()
+        head_config = camera_config["head_camera"]
+        source_binocular = bool(head_config.get("binocular", False))
+
+        if geometry_view_requested and args.display_mode == "pass-through":
+            raise RuntimeError(
+                "XR geometry/fusion views cannot be displayed in pass-through mode"
+            )
+        if geometry_view_requested and source_binocular:
+            raise RuntimeError(
+                "Aligned-depth XR geometry preview currently requires a "
+                "monocular head-camera configuration"
+            )
+        if dichoptic_stereo and source_binocular:
+            raise RuntimeError(
+                "--xr-stereo expects one monocular RGB-D source; the live "
+                "camera server already advertises a binocular source"
+            )
+        if dichoptic_stereo and args.display_mode == "pass-through":
+            raise RuntimeError("--xr-stereo requires immersive or ego display mode")
+        if dichoptic_stereo and not head_config.get("enable_zmq", False):
+            raise RuntimeError("--xr-stereo requires the head-camera ZMQ transport")
+        if geometry_view_requested and not head_config.get("enable_zmq", False):
+            raise RuntimeError(
+                "XR geometry/fusion views require the head-camera ZMQ transport"
+            )
+        try:
+            geometry_preview_contract = validate_geometry_preview_contract(
+                head_config,
+                args.xr_view,
+            )
+        except ValueError as error:
+            raise RuntimeError(
+                f"Invalid XR geometry-preview contract: {error}"
+            ) from error
+        if (
+            geometry_preview_contract is not None
+            and geometry_preview_contract.calibration_source == "pinned"
+        ):
+            logger_mp.warning(
+                "XR normal-based views use the exact pinned 640x480@30 "
+                "color intrinsics "
+                "for D435I serial 254322071415 because the camera server "
+                "omitted calibration metadata."
+            )
+        if fusion_view_requested:
+            logger_mp.warning(
+                "XR fusion reads the latest RGB and aligned-depth slots. They "
+                "are spatially aligned but not capture-synchronized; motion "
+                "can expose color/depth temporal seams."
+            )
+        if "near-warning" in args.xr_view:
+            logger_mp.warning(
+                "XR near-warning is a head-camera optical-axis depth cue, not "
+                "robot/end-effector clearance or collision prediction. "
+                "Untinted pixels are not a safety signal and may reflect "
+                "missing/out-of-range depth or a held preview frame."
+            )
+
+        # RGB can use the camera server's direct WebRTC stream. Geometry must
+        # use the local aligned-depth subscriber and TeleVuer image buffer.
+        headset_webrtc = bool(
+            head_config.get("enable_webrtc", False)
+            and not geometry_view_requested
+            and not dichoptic_stereo
+        )
+        if geometry_view_requested and head_config.get("enable_webrtc", False):
+            logger_mp.info(
+                "XR geometry selected: using the local ZMQ/TeleVuer buffer "
+                "instead of the camera RGB WebRTC stream."
+            )
+
+        source_shape = tuple(head_config["image_shape"])
+        display_shape = (
+            (source_shape[0], source_shape[1] * 2)
+            if dichoptic_stereo
+            else source_shape
+        )
+        display_binocular = dichoptic_stereo or source_binocular
+        tv_wrapper = televuer_wrapper_factory(
+            use_hand_tracking=args.input_mode == "hand",
+            binocular=display_binocular,
+            img_shape=display_shape,
+            display_mode=args.display_mode,
+            zmq=head_config["enable_zmq"],
+            webrtc=headset_webrtc,
+            webrtc_url=(
+                f"https://{args.img_server_ip}:"
+                f"{head_config['webrtc_port']}/offer"
+            ),
+        )
+
+        xr_need_local_img = not (
+            args.display_mode == "pass-through" or headset_webrtc
+        )
+        if xr_need_local_img:
+            xr_preview_worker = preview_worker_factory(
+                views=args.xr_view,
+                output_shape=display_shape,
+                render=tv_wrapper.render_to_xr,
+                read_color=(
+                    img_client.get_head_frame if color_view_requested else None
+                ),
+                read_aligned_depth=(
+                    img_client.get_head_depth_frame
+                    if geometry_view_requested
+                    else None
+                ),
+                geometry_contract=geometry_preview_contract,
+                max_fps=args.xr_preview_fps,
+                fusion_opacity=args.xr_fusion_opacity,
+                near_warning_m=args.xr_near_warning_m,
+                depth_contour_spacing_m=args.xr_depth_contour_spacing_m,
+                logger=logger_mp,
+            )
+            xr_preview_worker.start()
+
+        keyboard_thread = threading.Thread(
+            target=keyboard_listener,
+            kwargs={
+                "on_press": on_xr_camera_only_press,
+                "on_release": None,
+                "until": None,
+                "sequential": True,
+            },
+            name="xr-camera-only-keyboard",
+            daemon=True,
+        )
+        keyboard_thread.start()
+
+        READY = True
+        logger_mp.info("------------------------------------------------------------")
+        logger_mp.info(
+            "XR CAMERA-ONLY MODE: camera/headset services are active; "
+            "DDS and all robot controllers are disabled."
+        )
+        logger_mp.info(
+            "Headset mode: %s; view: %s; press [q] or Ctrl-C to exit.",
+            "dichoptic modality stereo"
+            if dichoptic_stereo
+            else ("source stereo" if source_binocular else "mono"),
+            "+".join(args.xr_view),
+        )
+        while not STOP:
+            sleep(0.033)
+    except KeyboardInterrupt:
+        logger_mp.info("XR camera-only session interrupted; exiting.")
+    finally:
+        READY = False
+        if keyboard_thread is not None:
+            try:
+                keyboard_stopper()
+                keyboard_thread.join(timeout=1.0)
+            except Exception as error:
+                logger_mp.error(
+                    f"Failed to stop XR camera-only keyboard listener: {error}"
+                )
+        if xr_preview_worker is not None:
+            try:
+                xr_preview_worker.close()
+            except Exception as error:
+                logger_mp.error(f"Failed to close XR preview worker: {error}")
+        if img_client is not None:
+            try:
+                img_client.close()
+            except Exception as error:
+                logger_mp.error(f"Failed to close image client: {error}")
+        if tv_wrapper is not None:
+            try:
+                tv_wrapper.close()
+            except Exception as error:
+                logger_mp.error(f"Failed to close TeleVuer wrapper: {error}")
+
+    logger_mp.info("XR camera-only session exited cleanly.")
+    return 0
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -124,7 +359,54 @@ if __name__ == '__main__':
         '--xr-preview-fps',
         type=float,
         default=DEFAULT_XR_PREVIEW_FPS,
-        help='Maximum local headset-preview rate (0 < FPS <= 30; default 15)',
+        help='Maximum local headset-preview rate (0 < FPS <= 30; default 30)',
+    )
+    parser.add_argument(
+        '--xr-fusion-opacity',
+        type=float,
+        default=DEFAULT_XR_FUSION_OPACITY,
+        help=(
+            'Geometry contribution for fused XR views (finite 0..1; '
+            'default 0.5)'
+        ),
+    )
+    parser.add_argument(
+        '--xr-near-warning-m',
+        type=float,
+        default=DEFAULT_XR_NEAR_WARNING_M,
+        help=(
+            'Far boundary in metres for the near-warning tint '
+            '(finite, 0.25 < value <= 1.0; default 0.45)'
+        ),
+    )
+    parser.add_argument(
+        '--xr-depth-contour-spacing-m',
+        type=float,
+        default=DEFAULT_XR_DEPTH_CONTOUR_SPACING_M,
+        help=(
+            'Optical-depth interval in metres for depth-contours '
+            '(finite, 0.001 <= value <= 0.75; default 0.05)'
+        ),
+    )
+    parser.add_argument(
+        '--xr-view-only',
+        '--xr-camera-only',
+        dest='xr_view_only',
+        action='store_true',
+        help=(
+            'Start only the camera-to-headset preview for safe mono/stereo '
+            'testing; do not initialize DDS or any robot controller'
+        ),
+    )
+    parser.add_argument(
+        '--xr-stereo',
+        '--xr-dichoptic',
+        dest='xr_stereo',
+        action='store_true',
+        help=(
+            'In --xr-view-only mode, send the first of exactly two --xr-view '
+            'modalities to the left eye and the second to the right eye'
+        ),
     )
     # mode flags
     parser.add_argument('--motion', action = 'store_true', help = 'Enable motion control mode')
@@ -146,16 +428,54 @@ if __name__ == '__main__':
     parser.add_argument('--task-steps', type = str, default = 'step1: do this; step2: do that;', help = 'task steps for recording at json file')
 
     args = parser.parse_args()
-    if args.ee in ("inspire_dfx", "inspire_ftp") and args.input_mode != "hand":
+    if (
+        not args.xr_view_only
+        and args.ee in ("inspire_dfx", "inspire_ftp")
+        and args.input_mode != "hand"
+    ):
         parser.error(f"--ee {args.ee} requires --input-mode hand")
     if args.episode_voice_feedback and not args.record:
         parser.error("--episode-voice-feedback requires --record")
+    if args.xr_view_only and args.record:
+        parser.error("--xr-view-only cannot be combined with --record")
     try:
         args.xr_view = normalize_xr_views(args.xr_view)
         args.xr_preview_fps = validate_xr_preview_fps(args.xr_preview_fps)
+        args.xr_fusion_opacity = validate_xr_fusion_opacity(
+            args.xr_fusion_opacity
+        )
+        args.xr_near_warning_m = validate_xr_near_warning_m(
+            args.xr_near_warning_m
+        )
+        args.xr_depth_contour_spacing_m = validate_xr_depth_contour_spacing_m(
+            args.xr_depth_contour_spacing_m
+        )
     except ValueError as error:
         parser.error(str(error))
+    if args.xr_stereo and not args.xr_view_only:
+        parser.error("--xr-stereo currently requires --xr-view-only")
+    if args.xr_stereo and len(args.xr_view) != 2:
+        parser.error("--xr-stereo requires exactly two ordered --xr-view options")
     logger_mp.info(f"args: {args}")
+    if args.xr_view_only:
+        ignored_robot_flags = [
+            flag
+            for enabled, flag in (
+                (args.motion, "--motion"),
+                (args.sim, "--sim"),
+                (args.ipc, "--ipc"),
+                (args.affinity, "--affinity"),
+                (args.network_interface is not None, "--network-interface"),
+                (args.ee is not None, "--ee"),
+            )
+            if enabled
+        ]
+        if ignored_robot_flags:
+            logger_mp.warning(
+                "--xr-view-only safely ignores robot-only options: %s",
+                ", ".join(ignored_robot_flags),
+            )
+        raise SystemExit(run_xr_camera_only(args))
     tactile_reader = None
     voice_notifier = None
     recording_controller = None
@@ -188,13 +508,13 @@ if __name__ == '__main__':
             listen_keyboard_thread.start()
 
         # image client
-        geometry_view_requested = bool(
-            set(args.xr_view) & {"depth", "normals"}
-        )
+        geometry_view_requested = xr_views_need_geometry(args.xr_view)
+        color_view_requested = xr_views_need_color(args.xr_view)
+        fusion_view_requested = xr_views_use_fusion(args.xr_view)
         img_client = ImageClient(
             host=args.img_server_ip,
             request_bgr=True,
-            eager_head_color=args.record or "rgb" in args.xr_view,
+            eager_head_color=args.record or color_view_requested,
             eager_aligned_depth=args.record or geometry_view_requested,
             eager_raw_depth=args.record,
         )
@@ -203,7 +523,7 @@ if __name__ == '__main__':
         head_config = camera_config["head_camera"]
         if geometry_view_requested and args.display_mode == "pass-through":
             raise RuntimeError(
-                "--xr-view depth/normals cannot be displayed in pass-through mode"
+                "XR geometry/fusion views cannot be displayed in pass-through mode"
             )
         if geometry_view_requested and head_config.get("binocular", False):
             raise RuntimeError(
@@ -212,7 +532,7 @@ if __name__ == '__main__':
             )
         if geometry_view_requested and not head_config.get("enable_zmq", False):
             raise RuntimeError(
-                "--xr-view depth/normals requires the head-camera ZMQ transport"
+                "XR geometry/fusion views require the head-camera ZMQ transport"
             )
         try:
             geometry_preview_contract = validate_geometry_preview_contract(
@@ -228,9 +548,23 @@ if __name__ == '__main__':
             and geometry_preview_contract.calibration_source == "pinned"
         ):
             logger_mp.warning(
-                "XR normals use the exact pinned 640x480@30 color intrinsics "
+                "XR normal-based views use the exact pinned 640x480@30 "
+                "color intrinsics "
                 "for D435I serial 254322071415 because the camera server "
                 "omitted calibration metadata."
+            )
+        if fusion_view_requested:
+            logger_mp.warning(
+                "XR fusion reads the latest RGB and aligned-depth slots. They "
+                "are spatially aligned but not capture-synchronized; motion "
+                "can expose color/depth temporal seams."
+            )
+        if "near-warning" in args.xr_view:
+            logger_mp.warning(
+                "XR near-warning is a head-camera optical-axis depth cue, not "
+                "robot/end-effector clearance or collision prediction. "
+                "Untinted pixels are not a safety signal and may reflect "
+                "missing/out-of-range depth or a held preview frame."
             )
 
         # WebRTC carries the camera's RGB stream directly. Explicit geometry
@@ -287,7 +621,7 @@ if __name__ == '__main__':
                 render=tv_wrapper.render_to_xr,
                 read_color=(
                     img_client.get_head_frame
-                    if "rgb" in args.xr_view
+                    if color_view_requested
                     else None
                 ),
                 read_aligned_depth=(
@@ -297,6 +631,9 @@ if __name__ == '__main__':
                 ),
                 geometry_contract=geometry_preview_contract,
                 max_fps=args.xr_preview_fps,
+                fusion_opacity=args.xr_fusion_opacity,
+                near_warning_m=args.xr_near_warning_m,
+                depth_contour_spacing_m=args.xr_depth_contour_spacing_m,
                 logger=logger_mp,
             )
             xr_preview_worker.start()
