@@ -1,5 +1,6 @@
 from pathlib import Path
 from queue import Empty, Full, Queue
+import re
 import shutil
 import subprocess
 import threading
@@ -14,6 +15,8 @@ STARTING_RECORDING = "Starting recording"
 STOPPING_RECORDING = "Stopping recording"
 RECORDING_SAVED = "Recording saved"
 EPISODE_COUNT_ANNOUNCEMENT_INTERVAL = 10
+_MAX_BUNDLED_EPISODE_COUNT = 1000
+_EPISODE_COUNT_MESSAGE_PATTERN = re.compile(r"^([0-9]+) episodes saved$")
 
 _PROMPT_FILENAMES = {
     STARTING_RECORDING: "starting_recording.wav",
@@ -23,6 +26,27 @@ _PROMPT_FILENAMES = {
 _DEFAULT_PROMPT_DIR = Path(__file__).with_name("episode_voice_prompts")
 
 _STOP = object()
+
+
+def _episode_count_from_message(message):
+    match = _EPISODE_COUNT_MESSAGE_PATTERN.fullmatch(message)
+    return None if match is None else int(match.group(1))
+
+
+def _prompt_filename(message):
+    prompt_filename = _PROMPT_FILENAMES.get(message)
+    if prompt_filename is not None:
+        return prompt_filename
+
+    episode_count = _episode_count_from_message(message)
+    if (
+        episode_count is None
+        or episode_count < EPISODE_COUNT_ANNOUNCEMENT_INTERVAL
+        or episode_count % EPISODE_COUNT_ANNOUNCEMENT_INTERVAL != 0
+        or episode_count > _MAX_BUNDLED_EPISODE_COUNT
+    ):
+        return None
+    return f"milestones/episodes_saved_{episode_count:04d}.wav"
 
 
 class AsyncEpisodeVoiceNotifier:
@@ -98,21 +122,31 @@ class AsyncEpisodeVoiceNotifier:
             self._warning_logged = True
         logger_mp.warning(message)
 
+    def _natural_prompt_path(self, message):
+        if not self._natural_voice_available:
+            return None
+        prompt_filename = _prompt_filename(message)
+        if prompt_filename is None:
+            return None
+        prompt_path = self._prompt_dir / prompt_filename
+        return prompt_path if prompt_path.is_file() else None
+
     def notify(self, message):
         """Queue a phrase without waiting for speech or queue capacity."""
         message = str(message)
         with self._state_lock:
             if self._closed or self._failed:
                 return False
-            # Bundled WAVs cover the fixed prompts. Dynamic count phrases need
-            # a text-to-speech executable; reject them without disabling the
-            # fixed voice feedback when only natural prompt playback exists.
-            if (
-                self._speaker is None
-                and message not in _PROMPT_FILENAMES
-                and self._executable is None
-            ):
-                return False
+            if self._speaker is None:
+                natural_prompt_path = self._natural_prompt_path(message)
+                if _episode_count_from_message(message) is not None:
+                    # Episode totals must never regress to the robotic
+                    # spd-say voice. Unsupported or missing totals are skipped
+                    # without disabling the fixed lifecycle prompts.
+                    if natural_prompt_path is None:
+                        return False
+                elif natural_prompt_path is None and self._executable is None:
+                    return False
             try:
                 self._queue.put_nowait(message)
             except Full:
@@ -151,12 +185,15 @@ class AsyncEpisodeVoiceNotifier:
             raise RuntimeError(f"{description} exited with status {process.returncode}")
 
     def _speak_message(self, message):
-        prompt_filename = _PROMPT_FILENAMES.get(message)
-        if self._natural_voice_available and prompt_filename is not None:
+        prompt_path = self._natural_prompt_path(message)
+        if prompt_path is not None:
             self._run_speech_process(
-                [self._audio_player, str(self._prompt_dir / prompt_filename)],
+                [self._audio_player, str(prompt_path)],
                 "natural voice playback",
             )
+            return
+
+        if _episode_count_from_message(message) is not None:
             return
 
         if self._executable is None:

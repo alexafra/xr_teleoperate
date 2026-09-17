@@ -1,3 +1,4 @@
+from pathlib import Path
 from tempfile import TemporaryDirectory
 import threading
 import unittest
@@ -5,7 +6,9 @@ from unittest.mock import Mock, patch
 
 from teleop.utils.episode_voice_feedback import (
     _DEFAULT_PROMPT_DIR,
+    _MAX_BUNDLED_EPISODE_COUNT,
     _PROMPT_FILENAMES,
+    _prompt_filename,
     EPISODE_COUNT_ANNOUNCEMENT_INTERVAL,
     RECORDING_SAVED,
     STARTING_RECORDING,
@@ -360,6 +363,21 @@ class TestAsyncEpisodeVoiceNotifier(unittest.TestCase):
                 prompt_file.seek(8)
                 self.assertEqual(prompt_file.read(4), b"WAVE")
 
+        milestone_counts = range(
+            EPISODE_COUNT_ANNOUNCEMENT_INTERVAL,
+            _MAX_BUNDLED_EPISODE_COUNT + 1,
+            EPISODE_COUNT_ANNOUNCEMENT_INTERVAL,
+        )
+        for episode_count in milestone_counts:
+            prompt_path = _DEFAULT_PROMPT_DIR / _prompt_filename(
+                f"{episode_count} episodes saved"
+            )
+            self.assertTrue(prompt_path.is_file(), prompt_path)
+            with prompt_path.open("rb") as prompt_file:
+                self.assertEqual(prompt_file.read(4), b"RIFF")
+                prompt_file.seek(8)
+                self.assertEqual(prompt_file.read(4), b"WAVE")
+
     def test_known_message_uses_bundled_natural_prompt(self):
         notifier = AsyncEpisodeVoiceNotifier(
             audio_player="/usr/bin/pw-play",
@@ -376,6 +394,58 @@ class TestAsyncEpisodeVoiceNotifier(unittest.TestCase):
             [
                 "/usr/bin/pw-play",
                 str(_DEFAULT_PROMPT_DIR / _PROMPT_FILENAMES[STARTING_RECORDING]),
+            ],
+            "natural voice playback",
+        )
+
+    def test_supported_milestones_use_complete_bundled_natural_prompts(self):
+        notifier = AsyncEpisodeVoiceNotifier(
+            audio_player="/usr/bin/pw-play",
+            executable="/usr/bin/spd-say",
+        )
+        run_process = Mock()
+        notifier._run_speech_process = run_process
+        try:
+            for episode_count in (20, 110, 1000):
+                notifier._speak_message(f"{episode_count} episodes saved")
+                run_process.assert_called_once_with(
+                    [
+                        "/usr/bin/pw-play",
+                        str(
+                            _DEFAULT_PROMPT_DIR
+                            / (
+                                "milestones/episodes_saved_"
+                                f"{episode_count:04d}.wav"
+                            )
+                        ),
+                    ],
+                    "natural voice playback",
+                )
+                run_process.reset_mock()
+        finally:
+            notifier.close()
+
+    def test_supported_milestone_does_not_require_spd_say(self):
+        with patch(
+            "teleop.utils.episode_voice_feedback.shutil.which",
+            return_value=None,
+        ):
+            notifier = AsyncEpisodeVoiceNotifier(
+                audio_player="/usr/bin/pw-play",
+            )
+        run_process = Mock()
+        notifier._run_speech_process = run_process
+
+        self.assertTrue(notifier.notify("20 episodes saved"))
+        notifier.close()
+
+        run_process.assert_called_once_with(
+            [
+                "/usr/bin/pw-play",
+                str(
+                    _DEFAULT_PROMPT_DIR
+                    / "milestones/episodes_saved_0020.wav"
+                ),
             ],
             "natural voice playback",
         )
@@ -399,20 +469,43 @@ class TestAsyncEpisodeVoiceNotifier(unittest.TestCase):
             "spd-say",
         )
 
-    def test_dynamic_count_without_tts_is_skipped_without_disabling_fixed_prompts(self):
-        with patch(
-            "teleop.utils.episode_voice_feedback.shutil.which",
-            return_value=None,
-        ):
+    def test_missing_milestone_is_skipped_without_disabling_fixed_prompts(self):
+        with TemporaryDirectory() as prompt_dir:
+            prompt_dir_path = Path(prompt_dir)
+            for filename in _PROMPT_FILENAMES.values():
+                (prompt_dir_path / filename).touch()
             notifier = AsyncEpisodeVoiceNotifier(
                 audio_player="/usr/bin/pw-play",
+                executable="/usr/bin/spd-say",
+                prompt_dir=prompt_dir,
             )
+            try:
+                self.assertTrue(notifier.available)
+                self.assertFalse(notifier.notify("10 episodes saved"))
+                self.assertTrue(notifier.available)
+            finally:
+                notifier.close()
+
+    def test_unsupported_milestone_never_falls_back_to_spd_say(self):
+        notifier = AsyncEpisodeVoiceNotifier(
+            audio_player="/usr/bin/pw-play",
+            executable="/usr/bin/spd-say",
+        )
+        run_process = Mock()
+        notifier._run_speech_process = run_process
         try:
-            self.assertTrue(notifier.available)
-            self.assertFalse(notifier.notify("10 episodes saved"))
-            self.assertTrue(notifier.available)
+            for message in (
+                "0 episodes saved",
+                "11 episodes saved",
+                "1001 episodes saved",
+                "1010 episodes saved",
+            ):
+                self.assertFalse(notifier.notify(message))
+                notifier._speak_message(message)
         finally:
             notifier.close()
+
+        run_process.assert_not_called()
 
     def test_speaker_runs_only_on_background_worker(self):
         spoken = []
