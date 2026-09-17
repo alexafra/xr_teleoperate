@@ -30,6 +30,14 @@ from teleop.utils.rgbd_capture import (
     PreferAtomicHeadRgbdCapture,
     should_prefer_atomic_rgbd_recording,
 )
+from teleop.utils.xr_geometry_preview import (
+    DEFAULT_XR_PREVIEW_FPS,
+    XR_VIEW_CHOICES,
+    XrPreviewWorker,
+    normalize_xr_views,
+    validate_geometry_preview_contract,
+    validate_xr_preview_fps,
+)
 from sshkeyboard import listen_keyboard, stop_listening
 
 # for simulation
@@ -102,6 +110,22 @@ if __name__ == '__main__':
     parser.add_argument('--ee', type=str, choices=['dex1', 'dex3', 'inspire_ftp', 'inspire_dfx', 'brainco'], help='Select end effector controller')
     parser.add_argument('--img-server-ip', type=str, default='192.168.123.164', help='IP address of image server, used by teleimager and televuer')
     parser.add_argument('--network-interface', type=str, default=None, help='Network interface for dds communication, e.g., eth0, wlan0. If None, use default interface.')
+    parser.add_argument(
+        '--xr-view',
+        action='append',
+        choices=XR_VIEW_CHOICES,
+        default=None,
+        help=(
+            'Headset image modality. Repeat to create a left-to-right split '
+            'view; omitted means the existing RGB view.'
+        ),
+    )
+    parser.add_argument(
+        '--xr-preview-fps',
+        type=float,
+        default=DEFAULT_XR_PREVIEW_FPS,
+        help='Maximum local headset-preview rate (0 < FPS <= 30; default 15)',
+    )
     # mode flags
     parser.add_argument('--motion', action = 'store_true', help = 'Enable motion control mode')
     parser.add_argument('--headless', action='store_true', help='Enable headless mode (no display)')
@@ -126,11 +150,17 @@ if __name__ == '__main__':
         parser.error(f"--ee {args.ee} requires --input-mode hand")
     if args.episode_voice_feedback and not args.record:
         parser.error("--episode-voice-feedback requires --record")
+    try:
+        args.xr_view = normalize_xr_views(args.xr_view)
+        args.xr_preview_fps = validate_xr_preview_fps(args.xr_preview_fps)
+    except ValueError as error:
+        parser.error(str(error))
     logger_mp.info(f"args: {args}")
     tactile_reader = None
     voice_notifier = None
     recording_controller = None
     recorder = None
+    xr_preview_worker = None
 
     try:
         # setup dds communication domains id
@@ -158,10 +188,62 @@ if __name__ == '__main__':
             listen_keyboard_thread.start()
 
         # image client
-        img_client = ImageClient(host=args.img_server_ip, request_bgr=True)
+        geometry_view_requested = bool(
+            set(args.xr_view) & {"depth", "normals"}
+        )
+        img_client = ImageClient(
+            host=args.img_server_ip,
+            request_bgr=True,
+            eager_head_color=args.record or "rgb" in args.xr_view,
+            eager_aligned_depth=args.record or geometry_view_requested,
+            eager_raw_depth=args.record,
+        )
         camera_config = img_client.get_cam_config()
         logger_mp.debug(f"Camera config: {camera_config}")
         head_config = camera_config["head_camera"]
+        if geometry_view_requested and args.display_mode == "pass-through":
+            raise RuntimeError(
+                "--xr-view depth/normals cannot be displayed in pass-through mode"
+            )
+        if geometry_view_requested and head_config.get("binocular", False):
+            raise RuntimeError(
+                "Aligned-depth XR geometry preview currently requires a "
+                "monocular head-camera configuration"
+            )
+        if geometry_view_requested and not head_config.get("enable_zmq", False):
+            raise RuntimeError(
+                "--xr-view depth/normals requires the head-camera ZMQ transport"
+            )
+        try:
+            geometry_preview_contract = validate_geometry_preview_contract(
+                head_config,
+                args.xr_view,
+            )
+        except ValueError as error:
+            raise RuntimeError(
+                f"Invalid XR geometry-preview contract: {error}"
+            ) from error
+        if (
+            geometry_preview_contract is not None
+            and geometry_preview_contract.calibration_source == "pinned"
+        ):
+            logger_mp.warning(
+                "XR normals use the exact pinned 640x480@30 color intrinsics "
+                "for D435I serial 254322071415 because the camera server "
+                "omitted calibration metadata."
+            )
+
+        # WebRTC carries the camera's RGB stream directly. Explicit geometry
+        # must use TeleVuer's local shared-image buffer instead.
+        headset_webrtc = bool(
+            head_config.get("enable_webrtc", False)
+            and not geometry_view_requested
+        )
+        if geometry_view_requested and head_config.get("enable_webrtc", False):
+            logger_mp.info(
+                "XR geometry selected: using the local ZMQ/TeleVuer buffer "
+                "instead of the camera RGB WebRTC stream."
+            )
         rgbd_capture = None
         if should_prefer_atomic_rgbd_recording(
             recording_enabled=args.record,
@@ -181,7 +263,9 @@ if __name__ == '__main__':
                 decode_atomic_frame=decode_rgbd_frame,
                 logger=logger_mp,
             )
-        xr_need_local_img = not (args.display_mode == 'pass-through' or camera_config['head_camera']['enable_webrtc'])
+        xr_need_local_img = not (
+            args.display_mode == 'pass-through' or headset_webrtc
+        )
 
         # televuer_wrapper: obtain hand pose data from the XR device and transmit the robot's head camera image to the XR device.
         tv_wrapper = TeleVuerWrapper(use_hand_tracking=args.input_mode == "hand", 
@@ -192,9 +276,35 @@ if __name__ == '__main__':
                                      # display_fps=camera_config['head_camera']['fps'] ? args.frequency? 30.0?
                                      display_mode=args.display_mode,
                                      zmq=camera_config['head_camera']['enable_zmq'],
-                                     webrtc=camera_config['head_camera']['enable_webrtc'],
+                                     webrtc=headset_webrtc,
                                      webrtc_url=f"https://{args.img_server_ip}:{camera_config['head_camera']['webrtc_port']}/offer",
                                      )
+
+        if xr_need_local_img:
+            xr_preview_worker = XrPreviewWorker(
+                views=args.xr_view,
+                output_shape=tuple(head_config['image_shape']),
+                render=tv_wrapper.render_to_xr,
+                read_color=(
+                    img_client.get_head_frame
+                    if "rgb" in args.xr_view
+                    else None
+                ),
+                read_aligned_depth=(
+                    img_client.get_head_depth_frame
+                    if geometry_view_requested
+                    else None
+                ),
+                geometry_contract=geometry_preview_contract,
+                max_fps=args.xr_preview_fps,
+                logger=logger_mp,
+            )
+            xr_preview_worker.start()
+            logger_mp.info(
+                "XR preview active: %s at up to %.1f FPS",
+                "+".join(args.xr_view),
+                args.xr_preview_fps,
+            )
         
         # motion mode (G1: Regular mode R1+X, not Running mode R2+A)
         if args.motion:
@@ -435,16 +545,9 @@ if __name__ == '__main__':
         while not START and not STOP: # wait for start or stop signal.
             time.sleep(0.033)
             if rgbd_capture is not None:
-                preview_rgbd = rgbd_capture.read()
-                if (
-                    xr_need_local_img
-                    and preview_rgbd is not None
-                    and preview_rgbd.color_bgr is not None
-                ):
-                    tv_wrapper.render_to_xr(preview_rgbd.color_bgr)
-            elif camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
-                head_img = img_client.get_head_frame()
-                tv_wrapper.render_to_xr(head_img.bgr)
+                # Preserve the experimental recorder transport's startup
+                # probing. Headset preview acquisition runs independently.
+                rgbd_capture.read()
 
         logger_mp.info("---------------------🚀start Tracking🚀-------------------------")
         arm_ctrl.speed_gradual_max()
@@ -463,16 +566,11 @@ if __name__ == '__main__':
                 record_head_bgr = rgbd_sample.color_bgr
                 head_depth = rgbd_sample.aligned_depth
                 rgbd_pairing = rgbd_sample.pairing
-                if xr_need_local_img and record_head_bgr is not None:
-                    tv_wrapper.render_to_xr(record_head_bgr)
             elif camera_config['head_camera']['enable_zmq']:
-                if args.record or xr_need_local_img:
+                if args.record:
                     head_img = img_client.get_head_frame()
-                    if args.record and head_img is not None:
+                    if head_img is not None:
                         record_head_bgr = head_img.bgr
-                if xr_need_local_img:
-                    tv_wrapper.render_to_xr(head_img.bgr)
-                    # tv_wrapper.render_to_xr(head_img)
             if (args.record and camera_config["head_camera"].get("enable_depth", False)):
                 if rgbd_capture is None:
                     head_depth = img_client.get_head_depth_frame()
@@ -770,6 +868,12 @@ if __name__ == '__main__':
         except Exception as e:
             logger_mp.error(f"Failed to stop keyboard listener or ipc server: {e}")
         
+        try:
+            if xr_preview_worker is not None:
+                xr_preview_worker.close()
+        except Exception as e:
+            logger_mp.error(f"Failed to close XR preview worker: {e}")
+
         try:
             img_client.close()
         except Exception as e:

@@ -220,6 +220,8 @@ build  cert.pem  key.pem  LICENSE  pyproject.toml  README.md  rootCA.key  rootCA
 |        `--ee`         | Select the end-effector type of the arm (see 0. 📖 Introduction) |     `dex1` `dex3` `inspire_ftp` `inspire_dfx` `brainco`      |       None        |
 |   `--img-server-ip`   | Set the image server IP address for receiving image streams and configuring WebRTC signaling |                        `IPv4` address                        | `192.168.123.164` |
 | `--network-interface` |    Set the network interface for CycloneDDS communication    |                    Network Interface Name                    |      `None`       |
+|      `--xr-view`      | Select a headset view; repeat the flag for a left-to-right split in flag order | `rgb` `depth` `normals` | `rgb` |
+| `--xr-preview-fps` | Cap local RGB/depth/normals preview work outside the control loop | Float greater than 0 and at most 30 | `15.0` |
 
 - **Mode switch parameters**
 
@@ -233,6 +235,36 @@ build  cert.pem  key.pem  LICENSE  pyproject.toml  README.md  rootCA.key  rootCA
 |  `--record`  | **Enable data recording mode** Press **r** to start teleoperation, then **s** to start recording; press **s** again to stop and save the episode. Press **s** repeatedly to repeat the process. |
 | `--episode-voice-feedback` | **Opt-in episode announcements** With `--record`, speak “Starting recording” after an episode is created, “Stopping recording” when its save is requested, and “Recording saved” only after the asynchronous writer completes. Speech is queued outside the control loop. The bundled neural WAV prompts play through PipeWire with `pw-play`; `spd-say` is retained as a fallback if those assets or the player are unavailable. |
 |  `--task-*`  | Configure the save path, target, description, and steps of the recorded task. |
+
+### Headset RGB and geometry views
+
+The historical command remains an RGB headset view. Select one canonical
+geometry view, or repeat `--xr-view` to split the existing TeleVuer image
+buffer left-to-right:
+
+```bash
+# Surface normals only
+python teleop_hand_and_arm.py --ee=inspire_ftp --motion --xr-view normals
+
+# RGB on the left, surface normals on the right
+python teleop_hand_and_arm.py --ee=inspire_ftp --motion \
+  --xr-view rgb --xr-view normals
+
+# Depth on the left, normals on the right, capped at 10 Hz
+python teleop_hand_and_arm.py --ee=inspire_ftp --motion \
+  --xr-view depth --xr-view normals --xr-preview-fps 10
+```
+
+Depth and normals are generated from the aligned-depth stream. Normals use the
+same calibrated-intrinsics, masked surface-normal v2 encoder and inclusive
+0.25–1.0 m validity range as current data processing. Geometry selection
+requires the aligned-depth ZMQ stream and a valid live calibration contract
+(or the exact pinned Inspire D435I fallback); it fails at startup otherwise.
+Because camera WebRTC carries RGB directly, selecting depth or normals routes
+the headset through the local ZMQ/TeleVuer buffer. Preview fetch, conversion,
+split composition, and rendering run in a capped latest-only worker; slow
+preview work drops intermediate display frames and does not change raw episode
+recording.
 
 ### Episode timing and DDS quality report
 
