@@ -1,8 +1,9 @@
+from pathlib import Path
+from queue import Empty, Full, Queue
 import shutil
 import subprocess
 import threading
 import time
-from queue import Empty, Full, Queue
 
 import logging_mp
 
@@ -12,6 +13,13 @@ logger_mp = logging_mp.getLogger(__name__)
 STARTING_RECORDING = "Starting recording"
 STOPPING_RECORDING = "Stopping recording"
 RECORDING_SAVED = "Recording saved"
+
+_PROMPT_FILENAMES = {
+    STARTING_RECORDING: "starting_recording.wav",
+    STOPPING_RECORDING: "stopping_recording.wav",
+    RECORDING_SAVED: "recording_saved.wav",
+}
+_DEFAULT_PROMPT_DIR = Path(__file__).with_name("episode_voice_prompts")
 
 _STOP = object()
 
@@ -25,6 +33,8 @@ class AsyncEpisodeVoiceNotifier:
         queue_capacity=8,
         speaker=None,
         executable=None,
+        audio_player=None,
+        prompt_dir=None,
         speech_timeout_s=15.0,
     ):
         if queue_capacity < 1:
@@ -41,17 +51,25 @@ class AsyncEpisodeVoiceNotifier:
         self._dropped_count = 0
         self._warning_logged = False
         self._state_lock = threading.Lock()
+        self._prompt_dir = Path(prompt_dir) if prompt_dir is not None else _DEFAULT_PROMPT_DIR
 
         if speaker is None:
+            self._audio_player = audio_player or shutil.which("pw-play")
             self._executable = executable or shutil.which("spd-say")
-            if self._executable is None:
+            self._natural_voice_available = self._audio_player is not None and all(
+                (self._prompt_dir / filename).is_file()
+                for filename in _PROMPT_FILENAMES.values()
+            )
+            if not self._natural_voice_available and self._executable is None:
                 self._failed = True
                 self._warn_once(
-                    "Episode voice feedback is disabled because spd-say "
-                    "is not installed."
+                    "Episode voice feedback is disabled because the bundled "
+                    "voice prompts cannot be played and spd-say is not installed."
                 )
         else:
+            self._audio_player = audio_player
             self._executable = executable
+            self._natural_voice_available = False
 
         self._worker = None
         if not self._failed:
@@ -93,9 +111,9 @@ class AsyncEpisodeVoiceNotifier:
                 return False
         return True
 
-    def _speak_with_spd_say(self, message):
+    def _run_speech_process(self, command, description):
         process = subprocess.Popen(
-            [self._executable, "--wait", message],
+            command,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -116,10 +134,24 @@ class AsyncEpisodeVoiceNotifier:
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait(timeout=0.5)
-                raise TimeoutError("spd-say did not finish before its timeout")
+                raise TimeoutError(f"{description} did not finish before its timeout")
 
         if process.returncode != 0:
-            raise RuntimeError(f"spd-say exited with status {process.returncode}")
+            raise RuntimeError(f"{description} exited with status {process.returncode}")
+
+    def _speak_message(self, message):
+        prompt_filename = _PROMPT_FILENAMES.get(message)
+        if self._natural_voice_available and prompt_filename is not None:
+            self._run_speech_process(
+                [self._audio_player, str(self._prompt_dir / prompt_filename)],
+                "natural voice playback",
+            )
+            return
+
+        self._run_speech_process(
+            [self._executable, "--wait", message],
+            "spd-say",
+        )
 
     def _run(self):
         while True:
@@ -136,7 +168,7 @@ class AsyncEpisodeVoiceNotifier:
                 if self._failed:
                     continue
                 if self._speaker is None:
-                    self._speak_with_spd_say(message)
+                    self._speak_message(message)
                 else:
                     self._speaker(message)
             except Exception as error:

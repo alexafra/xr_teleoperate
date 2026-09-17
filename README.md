@@ -231,7 +231,7 @@ build  cert.pem  key.pem  LICENSE  pyproject.toml  README.md  rootCA.key  rootCA
 |   `--ipc`    | **Inter-process communication mode** Allows controlling the xr_teleoperate program’s state via IPC. Suitable for interaction with agent programs. |
 | `--affinity` | **CPU affinity mode** Set CPU core affinity. If you are unsure what this is, do not set it. |
 |  `--record`  | **Enable data recording mode** Press **r** to start teleoperation, then **s** to start recording; press **s** again to stop and save the episode. Press **s** repeatedly to repeat the process. |
-| `--episode-voice-feedback` | **Opt-in episode announcements** With `--record`, speak “Starting recording” after an episode is created, “Stopping recording” when its save is requested, and “Recording saved” only after the asynchronous writer completes. Speech is queued outside the control loop and requires `spd-say`. |
+| `--episode-voice-feedback` | **Opt-in episode announcements** With `--record`, speak “Starting recording” after an episode is created, “Stopping recording” when its save is requested, and “Recording saved” only after the asynchronous writer completes. Speech is queued outside the control loop. The bundled neural WAV prompts play through PipeWire with `pw-play`; `spd-say` is retained as a fallback if those assets or the player are unavailable. |
 |  `--task-*`  | Configure the save path, target, description, and steps of the recorded task. |
 
 ### Episode timing and DDS quality report

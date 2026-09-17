@@ -1,7 +1,11 @@
+from tempfile import TemporaryDirectory
 import threading
 import unittest
+from unittest.mock import Mock
 
 from teleop.utils.episode_voice_feedback import (
+    _DEFAULT_PROMPT_DIR,
+    _PROMPT_FILENAMES,
     RECORDING_SAVED,
     STARTING_RECORDING,
     STOPPING_RECORDING,
@@ -255,6 +259,58 @@ class TestEpisodeRecordingController(unittest.TestCase):
 
 
 class TestAsyncEpisodeVoiceNotifier(unittest.TestCase):
+    def test_bundled_natural_prompts_are_complete_wav_files(self):
+        self.assertEqual(
+            set(_PROMPT_FILENAMES),
+            {STARTING_RECORDING, STOPPING_RECORDING, RECORDING_SAVED},
+        )
+        for filename in _PROMPT_FILENAMES.values():
+            prompt_path = _DEFAULT_PROMPT_DIR / filename
+            self.assertTrue(prompt_path.is_file(), prompt_path)
+            with prompt_path.open("rb") as prompt_file:
+                self.assertEqual(prompt_file.read(4), b"RIFF")
+                prompt_file.seek(8)
+                self.assertEqual(prompt_file.read(4), b"WAVE")
+
+    def test_known_message_uses_bundled_natural_prompt(self):
+        notifier = AsyncEpisodeVoiceNotifier(
+            audio_player="/usr/bin/pw-play",
+            executable="/usr/bin/spd-say",
+        )
+        run_process = Mock()
+        notifier._run_speech_process = run_process
+        try:
+            notifier._speak_message(STARTING_RECORDING)
+        finally:
+            notifier.close()
+
+        run_process.assert_called_once_with(
+            [
+                "/usr/bin/pw-play",
+                str(_DEFAULT_PROMPT_DIR / _PROMPT_FILENAMES[STARTING_RECORDING]),
+            ],
+            "natural voice playback",
+        )
+
+    def test_missing_prompt_assets_fall_back_to_spd_say(self):
+        with TemporaryDirectory() as prompt_dir:
+            notifier = AsyncEpisodeVoiceNotifier(
+                audio_player="/usr/bin/pw-play",
+                executable="/usr/bin/spd-say",
+                prompt_dir=prompt_dir,
+            )
+            run_process = Mock()
+            notifier._run_speech_process = run_process
+            try:
+                notifier._speak_message(STARTING_RECORDING)
+            finally:
+                notifier.close()
+
+        run_process.assert_called_once_with(
+            ["/usr/bin/spd-say", "--wait", STARTING_RECORDING],
+            "spd-say",
+        )
+
     def test_speaker_runs_only_on_background_worker(self):
         spoken = []
         spoke = threading.Event()
