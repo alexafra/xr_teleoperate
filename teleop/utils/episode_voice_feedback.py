@@ -11,6 +11,7 @@ import logging_mp
 
 logger_mp = logging_mp.getLogger(__name__)
 
+INITIALIZED_SUCCESSFULLY = "Initialized successfully"
 STARTING_RECORDING = "Starting recording"
 STOPPING_RECORDING = "Stopping recording"
 RECORDING_SAVED = "Recording saved"
@@ -19,6 +20,7 @@ _MAX_BUNDLED_EPISODE_COUNT = 1000
 _EPISODE_COUNT_MESSAGE_PATTERN = re.compile(r"^([0-9]+) episodes saved$")
 
 _PROMPT_FILENAMES = {
+    INITIALIZED_SUCCESSFULLY: "initialized_successfully.wav",
     STARTING_RECORDING: "starting_recording.wav",
     STOPPING_RECORDING: "stopping_recording.wav",
     RECORDING_SAVED: "recording_saved.wav",

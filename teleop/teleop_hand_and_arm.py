@@ -20,6 +20,7 @@ from teleimager.image_client import ImageClient
 from teleimager.geometry_preview import legacy_depth_metadata_from_head_config
 from teleop.utils.episode_writer import EpisodeWriter
 from teleop.utils.episode_voice_feedback import (
+    INITIALIZED_SUCCESSFULLY,
     AsyncEpisodeVoiceNotifier,
     EpisodeRecordingController,
 )
@@ -869,6 +870,8 @@ if __name__ == '__main__':
                 notifier=voice_notifier,
             )
             RECORD_CONTROLLER = recording_controller
+            if voice_notifier is not None:
+                voice_notifier.notify(INITIALIZED_SUCCESSFULLY)
 
         logger_mp.info("----------------------------------------------------------------")
         logger_mp.info("🟢  Press [r] to start syncing the robot with your movements.")

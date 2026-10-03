@@ -1,3 +1,4 @@
+import ast
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import threading
@@ -10,6 +11,7 @@ from teleop.utils.episode_voice_feedback import (
     _PROMPT_FILENAMES,
     _prompt_filename,
     EPISODE_COUNT_ANNOUNCEMENT_INTERVAL,
+    INITIALIZED_SUCCESSFULLY,
     RECORDING_SAVED,
     STARTING_RECORDING,
     STOPPING_RECORDING,
@@ -353,7 +355,12 @@ class TestAsyncEpisodeVoiceNotifier(unittest.TestCase):
     def test_bundled_natural_prompts_are_complete_wav_files(self):
         self.assertEqual(
             set(_PROMPT_FILENAMES),
-            {STARTING_RECORDING, STOPPING_RECORDING, RECORDING_SAVED},
+            {
+                INITIALIZED_SUCCESSFULLY,
+                STARTING_RECORDING,
+                STOPPING_RECORDING,
+                RECORDING_SAVED,
+            },
         )
         for filename in _PROMPT_FILENAMES.values():
             prompt_path = _DEFAULT_PROMPT_DIR / filename
@@ -378,7 +385,7 @@ class TestAsyncEpisodeVoiceNotifier(unittest.TestCase):
                 prompt_file.seek(8)
                 self.assertEqual(prompt_file.read(4), b"WAVE")
 
-    def test_known_message_uses_bundled_natural_prompt(self):
+    def test_fixed_messages_use_bundled_natural_prompts(self):
         notifier = AsyncEpisodeVoiceNotifier(
             audio_player="/usr/bin/pw-play",
             executable="/usr/bin/spd-say",
@@ -386,17 +393,66 @@ class TestAsyncEpisodeVoiceNotifier(unittest.TestCase):
         run_process = Mock()
         notifier._run_speech_process = run_process
         try:
-            notifier._speak_message(STARTING_RECORDING)
+            for message, filename in _PROMPT_FILENAMES.items():
+                notifier._speak_message(message)
+                run_process.assert_called_once_with(
+                    [
+                        "/usr/bin/pw-play",
+                        str(_DEFAULT_PROMPT_DIR / filename),
+                    ],
+                    "natural voice playback",
+                )
+                run_process.reset_mock()
         finally:
             notifier.close()
 
-        run_process.assert_called_once_with(
-            [
-                "/usr/bin/pw-play",
-                str(_DEFAULT_PROMPT_DIR / _PROMPT_FILENAMES[STARTING_RECORDING]),
-            ],
-            "natural voice playback",
-        )
+    def test_teleop_queues_initialized_once_after_voice_setup(self):
+        source_path = Path(__file__).parents[1] / "teleop_hand_and_arm.py"
+        tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        parents = {
+            child: parent
+            for parent in ast.walk(tree)
+            for child in ast.iter_child_nodes(parent)
+        }
+        constructors = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "AsyncEpisodeVoiceNotifier"
+        ]
+        announcements = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "voice_notifier"
+            and node.func.attr == "notify"
+            and len(node.args) == 1
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id == "INITIALIZED_SUCCESSFULLY"
+        ]
+
+        self.assertEqual(len(constructors), 1)
+        self.assertEqual(len(announcements), 1)
+        self.assertLess(constructors[0].lineno, announcements[0].lineno)
+
+        def ancestor_guards(node):
+            guards = []
+            while node in parents:
+                node = parents[node]
+                if isinstance(node, ast.If):
+                    guards.append(ast.unparse(node.test))
+            return guards
+
+        constructor_guards = ancestor_guards(constructors[0])
+        self.assertIn("args.record", constructor_guards)
+        self.assertIn("args.episode_voice_feedback", constructor_guards)
+
+        announcement_guards = ancestor_guards(announcements[0])
+        self.assertIn("args.record", announcement_guards)
+        self.assertIn("voice_notifier is not None", announcement_guards)
 
     def test_supported_milestones_use_complete_bundled_natural_prompts(self):
         notifier = AsyncEpisodeVoiceNotifier(
